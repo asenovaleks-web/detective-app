@@ -404,7 +404,82 @@ async def check_trustpilot(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 
-async def synthesize_with_claude(target: str, all_data: dict) -> dict:
+async def check_bulgarian_registry(domain: str, client: httpx.AsyncClient) -> dict:
+    """Scrape Bulgarian business registries — brra.bg (official) and papagal.bg (owner lookup)."""
+    try:
+        brand = domain.rsplit(".", 1)[0].replace("-", " ")
+
+        # ── brra.bg — Official Bulgarian Commercial Register ──────────────
+        brra_r = await client.get(
+            "https://brra.bg/GetDaoo.do",
+            params={"uic": "", "companyName": brand, "fromDate": "", "toDate": ""},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "bg,en;q=0.9",
+            },
+            timeout=15,
+            follow_redirects=True,
+        )
+
+        brra_found = False
+        brra_companies = []
+        if brra_r.status_code == 200:
+            text = brra_r.text
+            # Look for company entries in the response
+            if brand.lower() in text.lower() or "ЕИК" in text or "UIC" in text.upper():
+                brra_found = True
+                # Extract basic info if present
+                import re
+                companies = re.findall(r'class="company-name"[^>]*>([^<]+)<', text)
+                brra_companies = companies[:5] if companies else ["Record found — check brra.bg for full details"]
+
+        # ── papagal.bg — Owner & connected businesses lookup ─────────────
+        papagal_r = await client.get(
+            f"https://papagal.bg/search?q={brand}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "bg,en;q=0.9",
+            },
+            timeout=15,
+            follow_redirects=True,
+        )
+
+        papagal_found = False
+        papagal_data = {}
+        if papagal_r.status_code == 200:
+            text = papagal_r.text
+            if brand.lower() in text.lower():
+                papagal_found = True
+                import re
+                # Extract owner names if present
+                owners = re.findall(r'class="person-name"[^>]*>([^<]+)<', text)
+                companies = re.findall(r'class="company-title"[^>]*>([^<]+)<', text)
+                papagal_data = {
+                    "owners_found": owners[:3] if owners else [],
+                    "connected_companies": companies[:5] if companies else [],
+                    "url": f"https://papagal.bg/search?q={brand}",
+                }
+
+        return {
+            "brra": {
+                "found": brra_found,
+                "companies": brra_companies,
+                "url": f"https://brra.bg/GetDaoo.do?companyName={brand}",
+            },
+            "papagal": {
+                "found": papagal_found,
+                "data": papagal_data,
+                "url": f"https://papagal.bg/search?q={brand}",
+            },
+            "note": "Bulgarian registry check — covers official commercial register and owner network"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+
     """Send all raw intelligence to Claude for plain-English analysis."""
     if not ANTHROPIC_KEY:
         raise HTTPException(status_code=500, detail="No Anthropic API key configured")
@@ -481,10 +556,11 @@ async def investigate(req: InvestigateRequest):
                 search_reddit_mentions(domain, client) if req.include_reddit else asyncio.sleep(0),
                 check_urlscan(domain, client),
                 check_trustpilot(domain, client),
+                check_bulgarian_registry(domain, client),
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data, urlscan_data, trustpilot_data = results
+        whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data, urlscan_data, trustpilot_data, bulgarian_data = results
         logger.info(f"Data collected. WHOIS: {whois_data}, VT: {vt_data}, GSB: {gsb_data}")
 
         all_intelligence = {
@@ -497,6 +573,7 @@ async def investigate(req: InvestigateRequest):
             "community_signals": reddit_data,
             "urlscan": urlscan_data,
             "trustpilot": trustpilot_data,
+            "bulgarian_registry": bulgarian_data,
         }
 
         logger.info("Calling Claude for analysis...")
