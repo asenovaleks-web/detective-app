@@ -1,9 +1,27 @@
 """
-The Digital Detective — FastAPI Backend
-=======================================
-Run locally:
-  pip install fastapi uvicorn httpx python-dotenv
-  uvicorn main:app --reload --port 8000
+The Digital Detective — FastAPI Backend v3.0
+=============================================
+Data Sources (20 total):
+  1. WhoisXML — domain age & registrant
+  2. VirusTotal — 93 malware engines
+  3. Google Safe Browsing — threat database
+  4. SSL — live certificate check
+  5. GLEIF + UN Sanctions — global business & sanctions
+  6. Reddit via Pullpush — community signals
+  7. URLScan — live page analysis
+  8. Trustpilot — customer reviews
+  9. Bulgarian Registry — brra.bg + papagal.bg
+  10. UK Companies House — official UK register
+  11. SEC EDGAR — US securities filings
+  12. Wayback Machine — site history
+  13. ICIJ Offshore Leaks — Panama/Pandora Papers
+  14. BBB — US Better Business Bureau
+  15. Shodan — server infrastructure
+  16. Germany Bundesanzeiger — German register
+  17. Australia ASIC — Australian register
+  18. Canada Corporations — Canadian register
+  19. India MCA21 — Indian register
+  20. Singapore ACRA — Singapore register
 
 Environment variables required:
   ANTHROPIC_API_KEY
@@ -32,7 +50,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="The Digital Detective API", version="2.0.0")
+app = FastAPI(title="The Digital Detective API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -79,21 +97,24 @@ def clean_domain(target: str) -> str:
     return target.split("/")[0]
 
 
-# ── Data Sources ──────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA SOURCES
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def check_whoisxml(domain: str, client: httpx.AsyncClient) -> dict:
     if not WHOISXML_KEY:
         return {"error": "No WhoisXML API key configured"}
     try:
-        url = f"https://www.whoisxmlapi.com/whoisserver/WhoisService?apiKey={WHOISXML_KEY}&domainName={domain}&outputFormat=JSON"
-        r = await client.get(url, timeout=10)
+        r = await client.get(
+            f"https://www.whoisxmlapi.com/whoisserver/WhoisService?apiKey={WHOISXML_KEY}&domainName={domain}&outputFormat=JSON",
+            timeout=10,
+        )
         data = r.json().get("WhoisRecord", {})
         created_raw = data.get("createdDate", "")
         age_days = None
         if created_raw:
             try:
-                created = datetime.fromisoformat(created_raw[:10])
-                age_days = (datetime.now() - created).days
+                age_days = (datetime.now() - datetime.fromisoformat(created_raw[:10])).days
             except Exception:
                 pass
         return {
@@ -131,17 +152,19 @@ async def check_google_safe_browsing(domain: str, client: httpx.AsyncClient) -> 
     if not GOOGLE_SB_KEY:
         return {"error": "No Google Safe Browsing API key configured"}
     try:
-        url = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_SB_KEY}"
-        payload = {
-            "client": {"clientId": "digital-detective", "clientVersion": "0.1"},
-            "threatInfo": {
-                "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
-                "platformTypes": ["ANY_PLATFORM"],
-                "threatEntryTypes": ["URL"],
-                "threatEntries": [{"url": f"https://{domain}"}],
+        r = await client.post(
+            f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_SB_KEY}",
+            json={
+                "client": {"clientId": "digital-detective", "clientVersion": "0.1"},
+                "threatInfo": {
+                    "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+                    "platformTypes": ["ANY_PLATFORM"],
+                    "threatEntryTypes": ["URL"],
+                    "threatEntries": [{"url": f"https://{domain}"}],
+                },
             },
-        }
-        r = await client.post(url, json=payload, timeout=10)
+            timeout=10,
+        )
         threats = r.json().get("matches", [])
         return {"flagged": len(threats) > 0, "threats": [t.get("threatType") for t in threats]}
     except Exception as e:
@@ -162,8 +185,7 @@ async def check_ssl_info(domain: str, client: httpx.AsyncClient) -> dict:
         not_after = cert.get("notAfter", "")
         days_remaining = None
         if not_after:
-            expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-            days_remaining = (expiry - datetime.utcnow()).days
+            days_remaining = (datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z") - datetime.utcnow()).days
         return {
             "has_ssl": True,
             "issuer": issuer.get("organizationName", issuer.get("commonName", "Unknown")),
@@ -188,13 +210,11 @@ async def check_gleif(domain: str, client: httpx.AsyncClient) -> dict:
         )
         entities = r.json().get("data", [])
         results = [{"name": e.get("attributes", {}).get("value", ""), "lei": e.get("id", "")} for e in entities[:5]]
-
         un_r = await client.get(
             "https://scsanctions.un.org/resources/xml/en/consolidated.xml",
             timeout=10, follow_redirects=True,
         )
         sanctioned = brand.lower() in un_r.text.lower() if un_r.status_code == 200 else False
-
         return {
             "found": len(results) > 0,
             "companies": results,
@@ -263,13 +283,13 @@ async def check_trustpilot(domain: str, client: httpx.AsyncClient) -> dict:
             return {"found": False, "note": "No Trustpilot listing found"}
         match = next((b for b in businesses if brand in b.get("websiteUrl", "").lower()), businesses[0])
         review_count = match.get("numberOfReviews", {})
-        total_reviews = review_count.get("total", 0) if isinstance(review_count, dict) else review_count
+        total = review_count.get("total", 0) if isinstance(review_count, dict) else review_count
         return {
             "found": True,
             "name": match.get("displayName", ""),
             "stars": match.get("stars", 0),
             "trust_score": match.get("trustScore", 0),
-            "total_reviews": total_reviews,
+            "total_reviews": total,
             "url": f"https://www.trustpilot.com/review/{match.get('identifyingName', '')}",
             "claimed": match.get("claimed", False),
         }
@@ -286,33 +306,26 @@ async def check_bulgarian_registry(domain: str, client: httpx.AsyncClient) -> di
             headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "bg,en;q=0.9"},
             timeout=15, follow_redirects=True,
         )
-        brra_found = False
-        brra_companies = []
-        if brra_r.status_code == 200:
-            text = brra_r.text
-            if brand.lower() in text.lower():
-                brra_found = True
-                companies = re.findall(r'class="company-name"[^>]*>([^<]+)<', text)
-                brra_companies = companies[:5] if companies else ["Record found — check brra.bg"]
+        brra_found = brra_r.status_code == 200 and brand.lower() in brra_r.text.lower()
+        brra_companies = re.findall(r'class="company-name"[^>]*>([^<]+)<', brra_r.text)[:5] if brra_found else []
 
+        # papagal.bg — try with different headers to avoid 403
         papagal_r = await client.get(
-            f"https://papagal.bg/search?q={brand}",
-            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "bg,en;q=0.9"},
+            f"https://papagal.bg/en/company/search/{brand}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "bg-BG,bg;q=0.9,en;q=0.8",
+                "Referer": "https://papagal.bg/",
+            },
             timeout=15, follow_redirects=True,
         )
-        papagal_found = False
-        papagal_data = {}
-        if papagal_r.status_code == 200:
-            text = papagal_r.text
-            if brand.lower() in text.lower():
-                papagal_found = True
-                owners = re.findall(r'class="person-name"[^>]*>([^<]+)<', text)
-                companies = re.findall(r'class="company-title"[^>]*>([^<]+)<', text)
-                papagal_data = {"owners_found": owners[:3], "connected_companies": companies[:5]}
+        papagal_found = papagal_r.status_code == 200 and brand.lower() in papagal_r.text.lower()
+        papagal_owners = re.findall(r'class="person-name"[^>]*>([^<]+)<', papagal_r.text)[:3] if papagal_found else []
 
         return {
             "brra": {"found": brra_found, "companies": brra_companies, "url": f"https://brra.bg/GetDaoo.do?companyName={brand}"},
-            "papagal": {"found": papagal_found, "data": papagal_data, "url": f"https://papagal.bg/search?q={brand}"},
+            "papagal": {"found": papagal_found, "owners": papagal_owners, "url": f"https://papagal.bg/en/company/search/{brand}"},
         }
     except Exception as e:
         return {"error": str(e)}
@@ -328,17 +341,11 @@ async def check_companies_house(domain: str, client: httpx.AsyncClient) -> dict:
         )
         if r.status_code != 200:
             return {"found": False, "note": f"Companies House returned {r.status_code}"}
-        text = r.text
-        names = re.findall(r'class="govuk-link"[^>]*>([^<]+)</a>', text)
-        statuses = re.findall(r'class="govuk-tag[^"]*"[^>]*>([^<]+)</span>', text)
+        names = re.findall(r'class="govuk-link"[^>]*>([^<]+)</a>', r.text)
+        statuses = re.findall(r'class="govuk-tag[^"]*"[^>]*>([^<]+)</span>', r.text)
         companies = [{"name": names[i].strip(), "status": statuses[i].strip() if i < len(statuses) else "Unknown"} for i in range(min(5, len(names)))]
         dissolved = [c for c in companies if "dissolved" in c.get("status", "").lower()]
-        return {
-            "found": len(companies) > 0,
-            "companies": companies,
-            "dissolved_count": len(dissolved),
-            "search_url": f"https://find-and-update.company-information.service.gov.uk/search?q={brand}",
-        }
+        return {"found": len(companies) > 0, "companies": companies, "dissolved_count": len(dissolved)}
     except Exception as e:
         return {"error": str(e)}
 
@@ -350,12 +357,10 @@ async def check_sec_edgar(domain: str, client: httpx.AsyncClient) -> dict:
             f"https://www.sec.gov/cgi-bin/browse-edgar?company={brand}&CIK=&type=&dateb=&owner=include&count=10&search_text=&action=getcompany&output=atom",
             headers={"User-Agent": "DigitalDetective/1.0 contact@digitaldetective.app"}, timeout=10,
         )
-        companies = []
-        if r.status_code == 200:
-            names = re.findall(r'<company-name>([^<]+)</company-name>', r.text)
-            ciks = re.findall(r'<CIK>([^<]+)</CIK>', r.text)
-            companies = [{"name": n.strip(), "cik": c.strip()} for n, c in zip(names[:5], ciks[:5])]
-        return {"found": len(companies) > 0, "companies": companies, "note": "SEC EDGAR — US Securities filings"}
+        names = re.findall(r'<company-name>([^<]+)</company-name>', r.text) if r.status_code == 200 else []
+        ciks = re.findall(r'<CIK>([^<]+)</CIK>', r.text) if r.status_code == 200 else []
+        companies = [{"name": n.strip(), "cik": c.strip()} for n, c in zip(names[:5], ciks[:5])]
+        return {"found": len(companies) > 0, "companies": companies}
     except Exception as e:
         return {"error": str(e)}
 
@@ -367,7 +372,6 @@ async def check_wayback_machine(domain: str, client: httpx.AsyncClient) -> dict:
             headers={"User-Agent": "DigitalDetective/1.0"}, timeout=10,
         )
         snapshot = r.json().get("archived_snapshots", {}).get("closest", {})
-
         r2 = await client.get(
             f"https://web.archive.org/cdx/search/cdx?url={domain}&output=json&limit=1&fl=timestamp,statuscode&filter=statuscode:200",
             headers={"User-Agent": "DigitalDetective/1.0"}, timeout=10,
@@ -377,20 +381,12 @@ async def check_wayback_machine(domain: str, client: httpx.AsyncClient) -> dict:
         try:
             cdx_data = r2.json()
             if len(cdx_data) > 1:
-                timestamp = cdx_data[1][0]
-                first_seen = f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}"
-                first_seen_dt = datetime.strptime(first_seen, "%Y-%m-%d")
-                first_seen_age_days = (datetime.now() - first_seen_dt).days
+                ts = cdx_data[1][0]
+                first_seen = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}"
+                first_seen_age_days = (datetime.now() - datetime.strptime(first_seen, "%Y-%m-%d")).days
         except Exception:
             pass
-
-        return {
-            "found": bool(snapshot),
-            "latest_snapshot": snapshot.get("timestamp", ""),
-            "first_seen": first_seen,
-            "first_seen_age_days": first_seen_age_days,
-            "note": "Wayback Machine — internet archive history"
-        }
+        return {"found": bool(snapshot), "latest_snapshot": snapshot.get("timestamp", ""), "first_seen": first_seen, "first_seen_age_days": first_seen_age_days}
     except Exception as e:
         return {"error": str(e)}
 
@@ -406,17 +402,10 @@ async def check_icij_offshore(domain: str, client: httpx.AsyncClient) -> dict:
         )
         hits = []
         if r.status_code == 200:
-            text = r.text
-            names = re.findall(r'class="link-text">([^<]+)</span>', text)
-            jurisdictions = re.findall(r'class="jurisdiction[^"]*">([^<]+)<', text)
-            for i, name in enumerate(names[:5]):
-                hits.append({"name": name.strip(), "jurisdiction": jurisdictions[i].strip() if i < len(jurisdictions) else ""})
-        return {
-            "found": len(hits) > 0,
-            "hits": hits,
-            "search_url": f"https://offshoreleaks.icij.org/search?q={brand}",
-            "note": "ICIJ — Panama Papers, Pandora Papers, FinCEN Files"
-        }
+            names = re.findall(r'class="link-text">([^<]+)</span>', r.text)
+            jurisdictions = re.findall(r'class="jurisdiction[^"]*">([^<]+)<', r.text)
+            hits = [{"name": names[i].strip(), "jurisdiction": jurisdictions[i].strip() if i < len(jurisdictions) else ""} for i in range(min(5, len(names)))]
+        return {"found": len(hits) > 0, "hits": hits, "search_url": f"https://offshoreleaks.icij.org/search?q={brand}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -429,18 +418,9 @@ async def check_bbb(domain: str, client: httpx.AsyncClient) -> dict:
             headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
             timeout=15, follow_redirects=True,
         )
-        businesses = []
-        if r.status_code == 200:
-            text = r.text
-            names = re.findall(r'class="bds-h4 dtm-business-name[^"]*">([^<]+)<', text)
-            for name in names[:3]:
-                businesses.append({"name": name.strip()})
-        return {
-            "found": len(businesses) > 0,
-            "businesses": businesses,
-            "search_url": f"https://www.bbb.org/search?find_text={brand}",
-            "note": "Better Business Bureau — US complaints"
-        }
+        names = re.findall(r'class="bds-h4 dtm-business-name[^"]*">([^<]+)<', r.text) if r.status_code == 200 else []
+        businesses = [{"name": n.strip()} for n in names[:3]]
+        return {"found": len(businesses) > 0, "businesses": businesses}
     except Exception as e:
         return {"error": str(e)}
 
@@ -452,24 +432,128 @@ async def check_shodan(domain: str, client: httpx.AsyncClient) -> dict:
             headers={"User-Agent": "DigitalDetective/1.0"}, timeout=10,
         )
         if r.status_code != 200:
-            return {"found": False, "note": "No Shodan data for this domain"}
+            return {"found": False, "note": "No Shodan data"}
         data = r.json()
         open_ports = data.get("ports", [])
-        vulns = data.get("vulns", [])
         suspicious_ports = [p for p in open_ports if p in [21, 23, 25, 3389, 4444, 5900]]
+        return {"found": True, "open_ports": open_ports, "suspicious_ports": suspicious_ports, "vulnerabilities": data.get("vulns", []), "tags": data.get("tags", [])}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_germany_bundesanzeiger(domain: str, client: httpx.AsyncClient) -> dict:
+    """Search German Federal Gazette — official German company register."""
+    try:
+        brand = domain.rsplit(".", 1)[0].replace("-", " ")
+        r = await client.get(
+            "https://www.unternehmensregister.de/ureg/search.do",
+            params={"submitAction": "search", "companyName": brand, "searchType": "company"},
+            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "de,en;q=0.9"},
+            timeout=15, follow_redirects=True,
+        )
+        found = r.status_code == 200 and brand.lower() in r.text.lower()
+        companies = re.findall(r'class="result-company-name[^"]*">([^<]+)<', r.text)[:5] if found else []
         return {
-            "found": True,
-            "open_ports": open_ports,
-            "suspicious_ports": suspicious_ports,
-            "vulnerabilities": vulns,
-            "tags": data.get("tags", []),
-            "note": "Shodan — server infrastructure scan"
+            "found": found,
+            "companies": companies,
+            "search_url": f"https://www.unternehmensregister.de/ureg/search.do?companyName={brand}",
+            "note": "German Federal Company Register"
         }
     except Exception as e:
         return {"error": str(e)}
 
 
-# ── Claude Synthesis ──────────────────────────────────────────────────────────
+async def check_australia_asic(domain: str, client: httpx.AsyncClient) -> dict:
+    """Search ASIC — Australian Securities and Investments Commission."""
+    try:
+        brand = domain.rsplit(".", 1)[0].replace("-", " ")
+        r = await client.get(
+            "https://connectonline.asic.gov.au/RegistrySearch/faces/landing/SearchRegisters.jspx",
+            params={"_adf.ctrl-state": "search", "searchText": brand, "searchType": "OrgAndBusNm"},
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
+            timeout=15, follow_redirects=True,
+        )
+        found = r.status_code == 200 and brand.lower() in r.text.lower()
+        companies = re.findall(r'class="orgName[^"]*">([^<]+)<', r.text)[:5] if found else []
+        return {
+            "found": found,
+            "companies": companies,
+            "search_url": f"https://connectonline.asic.gov.au/RegistrySearch/faces/landing/SearchRegisters.jspx",
+            "note": "ASIC — Australian company register"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_canada_corporations(domain: str, client: httpx.AsyncClient) -> dict:
+    """Search Corporations Canada — federal company register."""
+    try:
+        brand = domain.rsplit(".", 1)[0].replace("-", " ")
+        r = await client.get(
+            "https://ised-isde.canada.ca/cc/lgcy/fdrlCrpSrch.html",
+            params={"V_SEARCH.dnm": brand, "V_SEARCH.Bsness_Nmbr": "", "V_SEARCH.CORPORATION_TYPE": "OT", "V_SEARCH.status": "A", "action": "search"},
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
+            timeout=15, follow_redirects=True,
+        )
+        found = r.status_code == 200 and brand.lower() in r.text.lower()
+        companies = re.findall(r'<td[^>]*class="[^"]*name[^"]*"[^>]*>([^<]+)<', r.text)[:5] if found else []
+        return {
+            "found": found,
+            "companies": [c.strip() for c in companies],
+            "note": "Corporations Canada — federal register"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_india_mca(domain: str, client: httpx.AsyncClient) -> dict:
+    """Search India Ministry of Corporate Affairs — MCA21 portal."""
+    try:
+        brand = domain.rsplit(".", 1)[0].replace("-", " ")
+        # MCA21 has a public search API
+        r = await client.get(
+            "https://www.mca.gov.in/mcafoportal/viewCompanyMasterData.do",
+            params={"companyName": brand},
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/html"},
+            timeout=15, follow_redirects=True,
+        )
+        found = r.status_code == 200 and brand.lower() in r.text.lower()
+        companies = re.findall(r'"companyName"\s*:\s*"([^"]+)"', r.text)[:5] if found else []
+        return {
+            "found": found,
+            "companies": companies,
+            "search_url": "https://www.mca.gov.in/mcafoportal/viewCompanyMasterData.do",
+            "note": "India MCA21 — Ministry of Corporate Affairs"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_singapore_acra(domain: str, client: httpx.AsyncClient) -> dict:
+    """Search Singapore ACRA Bizfile — official company register."""
+    try:
+        brand = domain.rsplit(".", 1)[0].replace("-", " ")
+        r = await client.get(
+            "https://www.bizfile.gov.sg/ngbbizfileinternet/faces/oracle/webcenter/portalapp/pages/BizfileHomepage.jspx",
+            params={"searchType": "ENT", "searchValue": brand},
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
+            timeout=15, follow_redirects=True,
+        )
+        found = r.status_code == 200 and brand.lower() in r.text.lower()
+        companies = re.findall(r'class="entity-name[^"]*">([^<]+)<', r.text)[:5] if found else []
+        return {
+            "found": found,
+            "companies": companies,
+            "search_url": "https://www.bizfile.gov.sg",
+            "note": "Singapore ACRA Bizfile — official register"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLAUDE SYNTHESIS
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def synthesize_with_claude(target: str, all_data: dict) -> dict:
     if not ANTHROPIC_KEY:
@@ -505,18 +589,24 @@ Respond ONLY with a valid JSON object (no markdown, no preamble):
     "Wayback Machine": "<value>",
     "ICIJ Offshore Leaks": "<value>",
     "BBB": "<value>",
-    "Shodan": "<value>"
+    "Shodan": "<value>",
+    "Germany Register": "<value>",
+    "Australia ASIC": "<value>",
+    "Canada Register": "<value>",
+    "India MCA": "<value>",
+    "Singapore ACRA": "<value>"
   }}
 }}
 
-Be honest and direct. If something looks like a scam, say so clearly. If safe, say that too."""
+Be honest and direct. If something looks like a scam, say so clearly. If safe, say that too.
+Only mention regional registries in findings if they return something meaningful — not every site will appear in every country's register."""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
-            json={"model": "claude-sonnet-4-6", "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}]},
-            timeout=30,
+            json={"model": "claude-sonnet-4-6", "max_tokens": 2000, "messages": [{"role": "user", "content": prompt}]},
+            timeout=45,
         )
     response_json = r.json()
     if "error" in response_json:
@@ -525,7 +615,9 @@ Be honest and direct. If something looks like a scam, say so clearly. If safe, s
     return json.loads(text.replace("```json", "").replace("```", "").strip())
 
 
-# ── Main Endpoint ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN ENDPOINT
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/investigate", response_model=InvestigateResponse)
 async def investigate(req: InvestigateRequest):
@@ -535,27 +627,33 @@ async def investigate(req: InvestigateRequest):
 
         async with httpx.AsyncClient() as client:
             tasks = [
-                check_whoisxml(domain, client),
-                check_virustotal(domain, client),
-                check_google_safe_browsing(domain, client),
-                check_ssl_info(domain, client),
-                check_gleif(domain, client) if req.include_business else asyncio.sleep(0),
-                search_reddit_mentions(domain, client) if req.include_reddit else asyncio.sleep(0),
-                check_urlscan(domain, client),
-                check_trustpilot(domain, client),
-                check_bulgarian_registry(domain, client),
-                check_companies_house(domain, client),
-                check_sec_edgar(domain, client),
-                check_wayback_machine(domain, client),
-                check_icij_offshore(domain, client),
-                check_bbb(domain, client),
-                check_shodan(domain, client),
+                check_whoisxml(domain, client),              # 0
+                check_virustotal(domain, client),             # 1
+                check_google_safe_browsing(domain, client),   # 2
+                check_ssl_info(domain, client),               # 3
+                check_gleif(domain, client),                  # 4
+                search_reddit_mentions(domain, client),       # 5
+                check_urlscan(domain, client),                # 6
+                check_trustpilot(domain, client),             # 7
+                check_bulgarian_registry(domain, client),     # 8
+                check_companies_house(domain, client),        # 9
+                check_sec_edgar(domain, client),              # 10
+                check_wayback_machine(domain, client),        # 11
+                check_icij_offshore(domain, client),          # 12
+                check_bbb(domain, client),                    # 13
+                check_shodan(domain, client),                 # 14
+                check_germany_bundesanzeiger(domain, client), # 15
+                check_australia_asic(domain, client),         # 16
+                check_canada_corporations(domain, client),    # 17
+                check_india_mca(domain, client),              # 18
+                check_singapore_acra(domain, client),         # 19
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
         (whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data,
          urlscan_data, trustpilot_data, bulgarian_data, uk_data, sec_data,
-         wayback_data, icij_data, bbb_data, shodan_data) = results
+         wayback_data, icij_data, bbb_data, shodan_data,
+         germany_data, australia_data, canada_data, india_data, singapore_data) = results
 
         logger.info(f"Data collected. WHOIS: {whois_data}, VT: {vt_data}, GSB: {gsb_data}")
 
@@ -565,22 +663,27 @@ async def investigate(req: InvestigateRequest):
             "virustotal": vt_data,
             "google_safe_browsing": gsb_data,
             "ssl": ssl_data,
-            "business_records": corp_data,
-            "community_signals": reddit_data,
+            "business_records_gleif": corp_data,
+            "community_signals_reddit": reddit_data,
             "urlscan": urlscan_data,
             "trustpilot": trustpilot_data,
             "bulgarian_registry": bulgarian_data,
             "uk_companies_house": uk_data,
-            "sec_edgar": sec_data,
+            "sec_edgar_usa": sec_data,
             "wayback_machine": wayback_data,
             "icij_offshore_leaks": icij_data,
-            "bbb": bbb_data,
+            "bbb_usa": bbb_data,
             "shodan": shodan_data,
+            "germany_register": germany_data,
+            "australia_asic": australia_data,
+            "canada_corporations": canada_data,
+            "india_mca": india_data,
+            "singapore_acra": singapore_data,
         }
 
         logger.info("Calling Claude for analysis...")
         analysis = await synthesize_with_claude(req.target, all_intelligence)
-        logger.info(f"Claude response: {analysis}")
+        logger.info(f"Claude verdict: {analysis.get('verdict')} score: {analysis.get('score')}")
 
         return InvestigateResponse(
             target=req.target,
