@@ -5,11 +5,11 @@ Run locally:
   pip install fastapi uvicorn httpx python-dotenv
   uvicorn main:app --reload --port 8000
 
-Set environment variables in a .env file:
-  VIRUSTOTAL_API_KEY=your_key
-  WHOISXML_API_KEY=your_key
-  GOOGLE_SAFE_BROWSING_KEY=your_key
-  ANTHROPIC_API_KEY=your_key
+Environment variables required:
+  ANTHROPIC_API_KEY
+  VIRUSTOTAL_API_KEY
+  WHOISXML_API_KEY
+  GOOGLE_SAFE_BROWSING_KEY
 """
 
 import asyncio
@@ -32,7 +32,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="The Digital Detective API", version="0.1.0")
+app = FastAPI(title="The Digital Detective API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -82,14 +82,10 @@ def clean_domain(target: str) -> str:
 # ── Data Sources ──────────────────────────────────────────────────────────────
 
 async def check_whoisxml(domain: str, client: httpx.AsyncClient) -> dict:
-    """Domain age, registrar, privacy proxy detection via WhoisXML API."""
     if not WHOISXML_KEY:
         return {"error": "No WhoisXML API key configured"}
     try:
-        url = (
-            f"https://www.whoisxmlapi.com/whoisserver/WhoisService"
-            f"?apiKey={WHOISXML_KEY}&domainName={domain}&outputFormat=JSON"
-        )
+        url = f"https://www.whoisxmlapi.com/whoisserver/WhoisService?apiKey={WHOISXML_KEY}&domainName={domain}&outputFormat=JSON"
         r = await client.get(url, timeout=10)
         data = r.json().get("WhoisRecord", {})
         created_raw = data.get("createdDate", "")
@@ -113,14 +109,12 @@ async def check_whoisxml(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 async def check_virustotal(domain: str, client: httpx.AsyncClient) -> dict:
-    """Scan domain against 70+ antivirus engines."""
     if not VIRUSTOTAL_KEY:
         return {"error": "No VirusTotal API key configured"}
     try:
         r = await client.get(
             f"https://www.virustotal.com/api/v3/domains/{domain}",
-            headers={"x-apikey": VIRUSTOTAL_KEY},
-            timeout=15,
+            headers={"x-apikey": VIRUSTOTAL_KEY}, timeout=15,
         )
         stats = r.json().get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
         return {
@@ -134,7 +128,6 @@ async def check_virustotal(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 async def check_google_safe_browsing(domain: str, client: httpx.AsyncClient) -> dict:
-    """Check against Google Safe Browsing threat database."""
     if not GOOGLE_SB_KEY:
         return {"error": "No Google Safe Browsing API key configured"}
     try:
@@ -150,30 +143,23 @@ async def check_google_safe_browsing(domain: str, client: httpx.AsyncClient) -> 
         }
         r = await client.post(url, json=payload, timeout=10)
         threats = r.json().get("matches", [])
-        return {
-            "flagged": len(threats) > 0,
-            "threats": [t.get("threatType") for t in threats],
-        }
+        return {"flagged": len(threats) > 0, "threats": [t.get("threatType") for t in threats]}
     except Exception as e:
         return {"error": str(e)}
 
 
 async def check_ssl_info(domain: str, client: httpx.AsyncClient) -> dict:
-    """Check live SSL certificate directly from the domain."""
     try:
         context = ssl.create_default_context()
         loop = asyncio.get_event_loop()
-
         def get_cert():
             with socket.create_connection((domain, 443), timeout=10) as sock:
                 with context.wrap_socket(sock, server_hostname=domain) as ssock:
                     return ssock.getpeercert()
-
         cert = await loop.run_in_executor(None, get_cert)
         issuer = dict(x[0] for x in cert.get("issuer", []))
         subject = dict(x[0] for x in cert.get("subject", []))
         not_after = cert.get("notAfter", "")
-        not_before = cert.get("notBefore", "")
         days_remaining = None
         if not_after:
             expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
@@ -182,7 +168,6 @@ async def check_ssl_info(domain: str, client: httpx.AsyncClient) -> dict:
             "has_ssl": True,
             "issuer": issuer.get("organizationName", issuer.get("commonName", "Unknown")),
             "issued_to": subject.get("commonName", domain),
-            "not_before": not_before,
             "not_after": not_after,
             "days_remaining": days_remaining,
             "expired": days_remaining < 0 if days_remaining is not None else False,
@@ -195,87 +180,60 @@ async def check_ssl_info(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 async def check_gleif(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search GLEIF for Legal Entity Identifiers — covers 200+ countries, no API key needed."""
     try:
         brand = domain.rsplit(".", 1)[0].replace("-", " ")
         r = await client.get(
             "https://api.gleif.org/api/v1/fuzzycompletions",
-            params={"field": "entity.legalName", "q": brand},
-            timeout=10,
+            params={"field": "entity.legalName", "q": brand}, timeout=10,
         )
         entities = r.json().get("data", [])
-        results = []
-        for e in entities[:5]:
-            attr = e.get("attributes", {})
-            results.append({"name": attr.get("value", ""), "lei": e.get("id", "")})
+        results = [{"name": e.get("attributes", {}).get("value", ""), "lei": e.get("id", "")} for e in entities[:5]]
 
-        # UN sanctions list
         un_r = await client.get(
             "https://scsanctions.un.org/resources/xml/en/consolidated.xml",
-            timeout=10,
-            follow_redirects=True,
+            timeout=10, follow_redirects=True,
         )
-        brand_lower = brand.lower()
-        sanctioned = brand_lower in un_r.text.lower() if un_r.status_code == 200 else False
+        sanctioned = brand.lower() in un_r.text.lower() if un_r.status_code == 200 else False
 
         return {
             "found": len(results) > 0,
             "companies": results,
             "sanctions_hits": 1 if sanctioned else 0,
-            "un_sanctions_check": "HIT - name appears in UN sanctions list" if sanctioned else "Clear",
+            "un_sanctions_check": "HIT" if sanctioned else "Clear",
         }
     except Exception as e:
         return {"error": str(e)}
 
 
 async def search_reddit_mentions(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search Reddit mentions via Pullpush.io — no authentication needed."""
     try:
         brand = domain.rsplit(".", 1)[0]
         r = await client.get(
             "https://api.pullpush.io/reddit/search/submission",
             params={"q": f"{brand} scam OR fraud OR complaint OR review", "size": 10, "sort": "desc"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10,
         )
         posts = r.json().get("data", [])
-        snippets = []
-        for p in posts[:5]:
-            snippets.append({
-                "title": p.get("title", ""),
-                "subreddit": p.get("subreddit", ""),
-                "score": p.get("score", 0),
-                "url": f"https://reddit.com{p.get('permalink', '')}",
-            })
+        snippets = [{"title": p.get("title", ""), "subreddit": p.get("subreddit", ""), "score": p.get("score", 0)} for p in posts[:5]]
         scam_posts = [p for p in posts if any(w in p.get("title", "").lower() for w in ["scam", "fraud", "fake", "cheat", "stolen"])]
-        return {
-            "total_found": len(posts),
-            "scam_keyword_posts": len(scam_posts),
-            "sample_posts": snippets,
-        }
+        return {"total_found": len(posts), "scam_keyword_posts": len(scam_posts), "sample_posts": snippets}
     except Exception as e:
         return {"error": str(e)}
 
 
 async def check_urlscan(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search URLScan.io for live page analysis — free, no key needed."""
     try:
         r = await client.get(
             "https://urlscan.io/api/v1/search/",
             params={"q": f"domain:{domain}", "size": 1},
-            headers={"User-Agent": "DigitalDetective/1.0"},
-            timeout=10,
+            headers={"User-Agent": "DigitalDetective/1.0"}, timeout=10,
         )
         results = r.json().get("results", [])
         if not results:
             return {"found": False, "note": "No previous scans found"}
-
         latest = results[0]
         page = latest.get("page", {})
-        verdicts = latest.get("verdicts", {})
-        overall = verdicts.get("overall", {})
-        task = latest.get("task", {})
-
+        overall = latest.get("verdicts", {}).get("overall", {})
         return {
             "found": True,
             "ip": page.get("ip", "Unknown"),
@@ -283,9 +241,7 @@ async def check_urlscan(domain: str, client: httpx.AsyncClient) -> dict:
             "server": page.get("server", "Unknown"),
             "malicious": overall.get("malicious", False),
             "score": overall.get("score", 0),
-            "categories": overall.get("categories", []),
             "tags": latest.get("tags", []),
-            "scan_date": task.get("time", ""),
             "report_url": f"https://urlscan.io/result/{latest.get('_id', '')}/",
         }
     except Exception as e:
@@ -293,34 +249,21 @@ async def check_urlscan(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 async def check_trustpilot(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search Trustpilot for business reviews and rating."""
     try:
         brand = domain.rsplit(".", 1)[0]
         r = await client.get(
-            f"https://www.trustpilot.com/api/categoriespages/find-business",
+            "https://www.trustpilot.com/api/categoriespages/find-business",
             params={"query": brand},
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, timeout=10,
         )
         if r.status_code != 200:
-            return {"found": False, "note": f"No Trustpilot listing found"}
-
+            return {"found": False, "note": "No Trustpilot listing found"}
         businesses = r.json().get("businesses", [])
         if not businesses:
             return {"found": False, "note": "No Trustpilot listing found"}
-
-        match = None
-        for b in businesses:
-            website = b.get("websiteUrl", "").lower()
-            if brand in website or domain in website:
-                match = b
-                break
-        if not match:
-            match = businesses[0]
-
+        match = next((b for b in businesses if brand in b.get("websiteUrl", "").lower()), businesses[0])
         review_count = match.get("numberOfReviews", {})
         total_reviews = review_count.get("total", 0) if isinstance(review_count, dict) else review_count
-
         return {
             "found": True,
             "name": match.get("displayName", ""),
@@ -335,44 +278,28 @@ async def check_trustpilot(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 async def check_bulgarian_registry(domain: str, client: httpx.AsyncClient) -> dict:
-    """Scrape Bulgarian business registries — brra.bg (official) and papagal.bg (owner lookup)."""
     try:
         brand = domain.rsplit(".", 1)[0].replace("-", " ")
-
-        # brra.bg — Official Bulgarian Commercial Register
         brra_r = await client.get(
             "https://brra.bg/GetDaoo.do",
             params={"uic": "", "companyName": brand, "fromDate": "", "toDate": ""},
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml",
-                "Accept-Language": "bg,en;q=0.9",
-            },
-            timeout=15,
-            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "bg,en;q=0.9"},
+            timeout=15, follow_redirects=True,
         )
-
         brra_found = False
         brra_companies = []
         if brra_r.status_code == 200:
             text = brra_r.text
-            if brand.lower() in text.lower() or "ЕИК" in text or "UIC" in text.upper():
+            if brand.lower() in text.lower():
                 brra_found = True
                 companies = re.findall(r'class="company-name"[^>]*>([^<]+)<', text)
-                brra_companies = companies[:5] if companies else ["Record found — check brra.bg for full details"]
+                brra_companies = companies[:5] if companies else ["Record found — check brra.bg"]
 
-        # papagal.bg — Owner & connected businesses lookup
         papagal_r = await client.get(
             f"https://papagal.bg/search?q={brand}",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml",
-                "Accept-Language": "bg,en;q=0.9",
-            },
-            timeout=15,
-            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "bg,en;q=0.9"},
+            timeout=15, follow_redirects=True,
         )
-
         papagal_found = False
         papagal_data = {}
         if papagal_r.status_code == 200:
@@ -381,51 +308,76 @@ async def check_bulgarian_registry(domain: str, client: httpx.AsyncClient) -> di
                 papagal_found = True
                 owners = re.findall(r'class="person-name"[^>]*>([^<]+)<', text)
                 companies = re.findall(r'class="company-title"[^>]*>([^<]+)<', text)
-                papagal_data = {
-                    "owners_found": owners[:3] if owners else [],
-                    "connected_companies": companies[:5] if companies else [],
-                    "url": f"https://papagal.bg/search?q={brand}",
-                }
+                papagal_data = {"owners_found": owners[:3], "connected_companies": companies[:5]}
 
         return {
-            "brra": {
-                "found": brra_found,
-                "companies": brra_companies,
-                "url": f"https://brra.bg/GetDaoo.do?companyName={brand}",
-            },
-            "papagal": {
-                "found": papagal_found,
-                "data": papagal_data,
-                "url": f"https://papagal.bg/search?q={brand}",
-            },
+            "brra": {"found": brra_found, "companies": brra_companies, "url": f"https://brra.bg/GetDaoo.do?companyName={brand}"},
+            "papagal": {"found": papagal_found, "data": papagal_data, "url": f"https://papagal.bg/search?q={brand}"},
         }
     except Exception as e:
         return {"error": str(e)}
 
 
+async def check_companies_house(domain: str, client: httpx.AsyncClient) -> dict:
+    try:
+        brand = domain.rsplit(".", 1)[0].replace("-", " ")
+        r = await client.get(
+            f"https://find-and-update.company-information.service.gov.uk/search?q={brand}",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
+            timeout=15, follow_redirects=True,
+        )
+        if r.status_code != 200:
+            return {"found": False, "note": f"Companies House returned {r.status_code}"}
+        text = r.text
+        names = re.findall(r'class="govuk-link"[^>]*>([^<]+)</a>', text)
+        statuses = re.findall(r'class="govuk-tag[^"]*"[^>]*>([^<]+)</span>', text)
+        companies = [{"name": names[i].strip(), "status": statuses[i].strip() if i < len(statuses) else "Unknown"} for i in range(min(5, len(names)))]
+        dissolved = [c for c in companies if "dissolved" in c.get("status", "").lower()]
+        return {
+            "found": len(companies) > 0,
+            "companies": companies,
+            "dissolved_count": len(dissolved),
+            "search_url": f"https://find-and-update.company-information.service.gov.uk/search?q={brand}",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_sec_edgar(domain: str, client: httpx.AsyncClient) -> dict:
+    try:
+        brand = domain.rsplit(".", 1)[0].replace("-", " ")
+        r = await client.get(
+            f"https://www.sec.gov/cgi-bin/browse-edgar?company={brand}&CIK=&type=&dateb=&owner=include&count=10&search_text=&action=getcompany&output=atom",
+            headers={"User-Agent": "DigitalDetective/1.0 contact@digitaldetective.app"}, timeout=10,
+        )
+        companies = []
+        if r.status_code == 200:
+            names = re.findall(r'<company-name>([^<]+)</company-name>', r.text)
+            ciks = re.findall(r'<CIK>([^<]+)</CIK>', r.text)
+            companies = [{"name": n.strip(), "cik": c.strip()} for n, c in zip(names[:5], ciks[:5])]
+        return {"found": len(companies) > 0, "companies": companies, "note": "SEC EDGAR — US Securities filings"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 async def check_wayback_machine(domain: str, client: httpx.AsyncClient) -> dict:
-    """Check Wayback Machine for site history — free, no key needed."""
     try:
         r = await client.get(
             f"https://archive.org/wayback/available?url={domain}",
-            headers={"User-Agent": "DigitalDetective/1.0"},
-            timeout=10,
+            headers={"User-Agent": "DigitalDetective/1.0"}, timeout=10,
         )
-        data = r.json()
-        snapshot = data.get("archived_snapshots", {}).get("closest", {})
+        snapshot = r.json().get("archived_snapshots", {}).get("closest", {})
 
-        # Also get the CDX API for first ever snapshot
         r2 = await client.get(
-            f"https://web.archive.org/cdx/search/cdx?url={domain}&output=json&limit=1&fl=timestamp,statuscode&from=19900101&to=20301231&filter=statuscode:200",
-            headers={"User-Agent": "DigitalDetective/1.0"},
-            timeout=10,
+            f"https://web.archive.org/cdx/search/cdx?url={domain}&output=json&limit=1&fl=timestamp,statuscode&filter=statuscode:200",
+            headers={"User-Agent": "DigitalDetective/1.0"}, timeout=10,
         )
         first_seen = None
         first_seen_age_days = None
         try:
             cdx_data = r2.json()
-            if len(cdx_data) > 1:  # First row is headers
-                timestamp = cdx_data[1][0]  # Format: YYYYMMDDHHMMSS
+            if len(cdx_data) > 1:
+                timestamp = cdx_data[1][0]
                 first_seen = f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}"
                 first_seen_dt = datetime.strptime(first_seen, "%Y-%m-%d")
                 first_seen_age_days = (datetime.now() - first_seen_dt).days
@@ -435,7 +387,6 @@ async def check_wayback_machine(domain: str, client: httpx.AsyncClient) -> dict:
         return {
             "found": bool(snapshot),
             "latest_snapshot": snapshot.get("timestamp", ""),
-            "latest_url": snapshot.get("url", ""),
             "first_seen": first_seen,
             "first_seen_age_days": first_seen_age_days,
             "note": "Wayback Machine — internet archive history"
@@ -445,204 +396,74 @@ async def check_wayback_machine(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 async def check_icij_offshore(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search ICIJ Offshore Leaks database — Panama Papers, Pandora Papers, free."""
     try:
         brand = domain.rsplit(".", 1)[0].replace("-", " ")
         r = await client.get(
             "https://offshoreleaks.icij.org/search",
             params={"q": brand, "c": "", "j": "", "d": ""},
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml",
-            },
-            timeout=15,
-            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
+            timeout=15, follow_redirects=True,
         )
-
         hits = []
         if r.status_code == 200:
             text = r.text
-            # Extract results
             names = re.findall(r'class="link-text">([^<]+)</span>', text)
-            types = re.findall(r'class="result-type[^"]*">([^<]+)<', text)
             jurisdictions = re.findall(r'class="jurisdiction[^"]*">([^<]+)<', text)
-
             for i, name in enumerate(names[:5]):
-                hits.append({
-                    "name": name.strip(),
-                    "type": types[i].strip() if i < len(types) else "",
-                    "jurisdiction": jurisdictions[i].strip() if i < len(jurisdictions) else "",
-                })
-
+                hits.append({"name": name.strip(), "jurisdiction": jurisdictions[i].strip() if i < len(jurisdictions) else ""})
         return {
             "found": len(hits) > 0,
             "hits": hits,
             "search_url": f"https://offshoreleaks.icij.org/search?q={brand}",
-            "note": "ICIJ Offshore Leaks — Panama Papers, Pandora Papers, FinCEN Files"
+            "note": "ICIJ — Panama Papers, Pandora Papers, FinCEN Files"
         }
     except Exception as e:
         return {"error": str(e)}
 
 
 async def check_bbb(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search Better Business Bureau for US complaints and accreditation."""
     try:
         brand = domain.rsplit(".", 1)[0].replace("-", " ")
         r = await client.get(
             f"https://www.bbb.org/search?find_text={brand}&find_country=USA",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml",
-            },
-            timeout=15,
-            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
+            timeout=15, follow_redirects=True,
         )
-
-        found = False
         businesses = []
         if r.status_code == 200:
             text = r.text
             names = re.findall(r'class="bds-h4 dtm-business-name[^"]*">([^<]+)<', text)
-            ratings = re.findall(r'BBB Rating</span>[^>]*>([^<]+)<', text)
-            accredited = "BBB Accredited" in text
-
-            for i, name in enumerate(names[:3]):
-                businesses.append({
-                    "name": name.strip(),
-                    "rating": ratings[i].strip() if i < len(ratings) else "Not rated",
-                })
-            found = len(businesses) > 0
-
+            for name in names[:3]:
+                businesses.append({"name": name.strip()})
         return {
-            "found": found,
+            "found": len(businesses) > 0,
             "businesses": businesses,
             "search_url": f"https://www.bbb.org/search?find_text={brand}",
-            "note": "Better Business Bureau — US complaints and accreditation"
+            "note": "Better Business Bureau — US complaints"
         }
     except Exception as e:
         return {"error": str(e)}
 
 
 async def check_shodan(domain: str, client: httpx.AsyncClient) -> dict:
-    """Check Shodan for server infrastructure info — free public search."""
     try:
         r = await client.get(
             f"https://internetdb.shodan.io/{domain}",
-            headers={"User-Agent": "DigitalDetective/1.0"},
-            timeout=10,
+            headers={"User-Agent": "DigitalDetective/1.0"}, timeout=10,
         )
-
-        if r.status_code == 404:
-            # Try resolving domain to IP first
-            return {"found": False, "note": "No Shodan data for this domain"}
-
         if r.status_code != 200:
-            return {"found": False, "note": f"Shodan returned {r.status_code}"}
-
+            return {"found": False, "note": "No Shodan data for this domain"}
         data = r.json()
         open_ports = data.get("ports", [])
         vulns = data.get("vulns", [])
-        tags = data.get("tags", [])
-        hostnames = data.get("hostnames", [])
-        cpes = data.get("cpes", [])
-
-        suspicious_ports = [p for p in open_ports if p in [21, 23, 25, 3389, 4444, 5900, 8443]]
-
+        suspicious_ports = [p for p in open_ports if p in [21, 23, 25, 3389, 4444, 5900]]
         return {
             "found": True,
             "open_ports": open_ports,
             "suspicious_ports": suspicious_ports,
             "vulnerabilities": vulns,
-            "tags": tags,
-            "hostnames": hostnames[:5],
-            "software": cpes[:5],
-            "note": "Shodan InternetDB — server infrastructure scan"
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-
-    """Search UK Companies House via public search — no API key needed."""
-    try:
-        brand = domain.rsplit(".", 1)[0].replace("-", " ")
-
-        # Use the public search endpoint which doesn't require auth
-        r = await client.get(
-            f"https://find-and-update.company-information.service.gov.uk/search?q={brand}",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml",
-            },
-            timeout=15,
-            follow_redirects=True,
-        )
-
-        if r.status_code != 200:
-            return {"found": False, "note": f"Companies House returned {r.status_code}"}
-
-        text = r.text
-        # Extract company names and numbers from HTML
-        names = re.findall(r'class="govuk-link"[^>]*>([^<]+)</a>', text)
-        numbers = re.findall(r'Company number</dt>\s*<dd[^>]*>([^<]+)</dd>', text)
-        statuses = re.findall(r'class="govuk-tag[^"]*"[^>]*>([^<]+)</span>', text)
-
-        companies = []
-        for i, name in enumerate(names[:5]):
-            companies.append({
-                "name": name.strip(),
-                "company_number": numbers[i].strip() if i < len(numbers) else "",
-                "status": statuses[i].strip() if i < len(statuses) else "Unknown",
-            })
-
-        dissolved = [c for c in companies if "dissolved" in c.get("status", "").lower()]
-
-        return {
-            "found": len(companies) > 0,
-            "companies": companies,
-            "dissolved_count": len(dissolved),
-            "search_url": f"https://find-and-update.company-information.service.gov.uk/search?q={brand}",
-            "note": "UK Companies House — official registry"
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-async def check_sec_edgar(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search SEC EDGAR for US company filings — free, no API key needed."""
-    try:
-        brand = domain.rsplit(".", 1)[0].replace("-", " ")
-        r = await client.get(
-            "https://efts.sec.gov/LATEST/search-index?q=%22{brand}%22&dateRange=custom&startdt=2000-01-01&forms=10-K,S-1,8-K".format(brand=brand),
-            headers={"User-Agent": "DigitalDetective/1.0 contact@digitaldetective.app"},
-            timeout=10,
-        )
-
-        # Also search the company search endpoint
-        r2 = await client.get(
-            f"https://www.sec.gov/cgi-bin/browse-edgar?company={brand}&CIK=&type=&dateb=&owner=include&count=10&search_text=&action=getcompany&output=atom",
-            headers={"User-Agent": "DigitalDetective/1.0 contact@digitaldetective.app"},
-            timeout=10,
-        )
-
-        found = False
-        companies = []
-        if r2.status_code == 200:
-            text = r2.text
-            names = re.findall(r'<company-name>([^<]+)</company-name>', text)
-            ciks = re.findall(r'<CIK>([^<]+)</CIK>', text)
-            for name, cik in zip(names[:5], ciks[:5]):
-                companies.append({
-                    "name": name.strip(),
-                    "cik": cik.strip(),
-                    "url": f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik.strip()}"
-                })
-            found = len(companies) > 0
-
-        return {
-            "found": found,
-            "companies": companies,
-            "note": "SEC EDGAR — US Securities and Exchange Commission filings"
+            "tags": data.get("tags", []),
+            "note": "Shodan — server infrastructure scan"
         }
     except Exception as e:
         return {"error": str(e)}
@@ -651,7 +472,6 @@ async def check_sec_edgar(domain: str, client: httpx.AsyncClient) -> dict:
 # ── Claude Synthesis ──────────────────────────────────────────────────────────
 
 async def synthesize_with_claude(target: str, all_data: dict) -> dict:
-    """Send all raw intelligence to Claude for plain-English analysis."""
     if not ANTHROPIC_KEY:
         raise HTTPException(status_code=500, detail="No Anthropic API key configured")
 
@@ -671,6 +491,7 @@ Respond ONLY with a valid JSON object (no markdown, no preamble):
   "narrative": "<3-4 sentence plain-English detective summary for a non-technical person. Direct, everyday language.>",
   "raw_labels": {{
     "Domain Age": "<value>",
+    "First Seen Online": "<value>",
     "SSL Issuer": "<value>",
     "Malware Flags": "<value>",
     "Reddit Signals": "<value>",
@@ -693,16 +514,8 @@ Be honest and direct. If something looks like a scam, say so clearly. If safe, s
     async with httpx.AsyncClient() as client:
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-6",
-                "max_tokens": 1500,
-                "messages": [{"role": "user", "content": prompt}],
-            },
+            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+            json={"model": "claude-sonnet-4-6", "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}]},
             timeout=30,
         )
     response_json = r.json()
@@ -740,7 +553,10 @@ async def investigate(req: InvestigateRequest):
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data, urlscan_data, trustpilot_data, bulgarian_data, uk_data, sec_data, wayback_data, icij_data, bbb_data, shodan_data = results
+        (whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data,
+         urlscan_data, trustpilot_data, bulgarian_data, uk_data, sec_data,
+         wayback_data, icij_data, bbb_data, shodan_data) = results
+
         logger.info(f"Data collected. WHOIS: {whois_data}, VT: {vt_data}, GSB: {gsb_data}")
 
         all_intelligence = {
