@@ -30,7 +30,7 @@ app = FastAPI(title="The Digital Detective API", version="0.1.0")
 # Allow your React frontend to call this
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "https://your-frontend.vercel.app"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -284,7 +284,10 @@ Be honest. If something looks like a scam, say so clearly. If safe, say that too
             timeout=30,
         )
     import json
-    text = r.json()["content"][0]["text"]
+    response_json = r.json()
+    if "error" in response_json:
+        raise HTTPException(status_code=500, detail=f"Claude API error: {response_json['error']}")
+    text = response_json["content"][0]["text"]
     return json.loads(text.replace("```json", "").replace("```", "").strip())
 
 
