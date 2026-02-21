@@ -30,10 +30,15 @@ app = FastAPI(title="The Digital Detective API", version="0.1.0")
 # Allow your React frontend to call this
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://your-frontend.vercel.app"],
-    allow_methods=["*"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+@app.options("/investigate")
+async def options_investigate():
+    return {"status": "ok"}
 
 # ── Config ────────────────────────────────────────────────────────────────────
 VIRUSTOTAL_KEY      = os.getenv("VIRUSTOTAL_API_KEY", "")
