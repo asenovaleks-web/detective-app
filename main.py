@@ -2,7 +2,7 @@
 The Digital Detective — FastAPI Backend
 =======================================
 Run locally:
-  pip install fastapi uvicorn httpx python-whois python-dotenv
+  pip install fastapi uvicorn httpx python-dotenv
   uvicorn main:app --reload --port 8000
 
 Set environment variables in a .env file:
@@ -13,9 +13,14 @@ Set environment variables in a .env file:
 """
 
 import asyncio
+import json
+import logging
 import os
+import re
+import socket
+import ssl
+import traceback
 from datetime import datetime, timezone
-from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -24,10 +29,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="The Digital Detective API", version="0.1.0")
 
-# Allow your React frontend to call this
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,18 +47,17 @@ async def options_investigate():
     return {"status": "ok"}
 
 # ── Config ────────────────────────────────────────────────────────────────────
-VIRUSTOTAL_KEY      = os.getenv("VIRUSTOTAL_API_KEY", "")
-WHOISXML_KEY        = os.getenv("WHOISXML_API_KEY", "")
-GOOGLE_SB_KEY       = os.getenv("GOOGLE_SAFE_BROWSING_KEY", "")
-ANTHROPIC_KEY       = os.getenv("ANTHROPIC_API_KEY", "")
+VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
+WHOISXML_KEY   = os.getenv("WHOISXML_API_KEY", "")
+GOOGLE_SB_KEY  = os.getenv("GOOGLE_SAFE_BROWSING_KEY", "")
+ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 
 
-# ── Request / Response models ─────────────────────────────────────────────────
+# ── Models ────────────────────────────────────────────────────────────────────
 class InvestigateRequest(BaseModel):
-    target: str                    # URL, domain, or app name
+    target: str
     include_reddit: bool = True
     include_business: bool = True
-
 
 class InvestigateResponse(BaseModel):
     target: str
@@ -65,7 +70,7 @@ class InvestigateResponse(BaseModel):
     raw_data: dict
 
 
-# ── Helper: clean domain ──────────────────────────────────────────────────────
+# ── Helper ────────────────────────────────────────────────────────────────────
 def clean_domain(target: str) -> str:
     target = target.strip().lower()
     for prefix in ("https://", "http://", "www."):
@@ -74,7 +79,7 @@ def clean_domain(target: str) -> str:
     return target.split("/")[0]
 
 
-# ── Data source functions (all async, run in parallel) ────────────────────────
+# ── Data Sources ──────────────────────────────────────────────────────────────
 
 async def check_whoisxml(domain: str, client: httpx.AsyncClient) -> dict:
     """Domain age, registrar, privacy proxy detection via WhoisXML API."""
@@ -88,7 +93,6 @@ async def check_whoisxml(domain: str, client: httpx.AsyncClient) -> dict:
         r = await client.get(url, timeout=10)
         data = r.json().get("WhoisRecord", {})
         created_raw = data.get("createdDate", "")
-        created = None
         age_days = None
         if created_raw:
             try:
@@ -109,17 +113,16 @@ async def check_whoisxml(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 async def check_virustotal(domain: str, client: httpx.AsyncClient) -> dict:
-    """Scan domain against 70+ antivirus / reputation engines."""
+    """Scan domain against 70+ antivirus engines."""
     if not VIRUSTOTAL_KEY:
         return {"error": "No VirusTotal API key configured"}
     try:
-        headers = {"x-apikey": VIRUSTOTAL_KEY}
         r = await client.get(
             f"https://www.virustotal.com/api/v3/domains/{domain}",
-            headers=headers, timeout=15
+            headers={"x-apikey": VIRUSTOTAL_KEY},
+            timeout=15,
         )
-        data = r.json()
-        stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+        stats = r.json().get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
         return {
             "malicious": stats.get("malicious", 0),
             "suspicious": stats.get("suspicious", 0),
@@ -131,7 +134,7 @@ async def check_virustotal(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 async def check_google_safe_browsing(domain: str, client: httpx.AsyncClient) -> dict:
-    """Check against Google's Safe Browsing threat database."""
+    """Check against Google Safe Browsing threat database."""
     if not GOOGLE_SB_KEY:
         return {"error": "No Google Safe Browsing API key configured"}
     try:
@@ -146,14 +149,49 @@ async def check_google_safe_browsing(domain: str, client: httpx.AsyncClient) -> 
             },
         }
         r = await client.post(url, json=payload, timeout=10)
-        data = r.json()
-        threats = data.get("matches", [])
+        threats = r.json().get("matches", [])
         return {
             "flagged": len(threats) > 0,
             "threats": [t.get("threatType") for t in threats],
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+async def check_ssl_info(domain: str, client: httpx.AsyncClient) -> dict:
+    """Check live SSL certificate directly from the domain."""
+    try:
+        context = ssl.create_default_context()
+        loop = asyncio.get_event_loop()
+
+        def get_cert():
+            with socket.create_connection((domain, 443), timeout=10) as sock:
+                with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                    return ssock.getpeercert()
+
+        cert = await loop.run_in_executor(None, get_cert)
+        issuer = dict(x[0] for x in cert.get("issuer", []))
+        subject = dict(x[0] for x in cert.get("subject", []))
+        not_after = cert.get("notAfter", "")
+        not_before = cert.get("notBefore", "")
+        days_remaining = None
+        if not_after:
+            expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+            days_remaining = (expiry - datetime.utcnow()).days
+        return {
+            "has_ssl": True,
+            "issuer": issuer.get("organizationName", issuer.get("commonName", "Unknown")),
+            "issued_to": subject.get("commonName", domain),
+            "not_before": not_before,
+            "not_after": not_after,
+            "days_remaining": days_remaining,
+            "expired": days_remaining < 0 if days_remaining is not None else False,
+            "self_signed": issuer.get("commonName") == subject.get("commonName"),
+        }
+    except ssl.SSLCertVerificationError as e:
+        return {"has_ssl": True, "error": f"SSL verification failed: {str(e)}", "self_signed": True}
+    except Exception as e:
+        return {"has_ssl": False, "error": str(e)}
 
 
 async def check_gleif(domain: str, client: httpx.AsyncClient) -> dict:
@@ -165,20 +203,17 @@ async def check_gleif(domain: str, client: httpx.AsyncClient) -> dict:
             params={"field": "entity.legalName", "q": brand},
             timeout=10,
         )
-        data = r.json()
-        entities = data.get("data", [])
+        entities = r.json().get("data", [])
         results = []
         for e in entities[:5]:
             attr = e.get("attributes", {})
-            results.append({
-                "name": attr.get("value", ""),
-                "lei": e.get("id", ""),
-            })
+            results.append({"name": attr.get("value", ""), "lei": e.get("id", "")})
 
-        # Check UN consolidated sanctions list — free, no key needed
+        # UN sanctions list
         un_r = await client.get(
             "https://scsanctions.un.org/resources/xml/en/consolidated.xml",
             timeout=10,
+            follow_redirects=True,
         )
         brand_lower = brand.lower()
         sanctioned = brand_lower in un_r.text.lower() if un_r.status_code == 200 else False
@@ -203,8 +238,7 @@ async def search_reddit_mentions(domain: str, client: httpx.AsyncClient) -> dict
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=10,
         )
-        data = r.json()
-        posts = data.get("data", [])
+        posts = r.json().get("data", [])
         snippets = []
         for p in posts[:5]:
             snippets.append({
@@ -223,63 +257,18 @@ async def search_reddit_mentions(domain: str, client: httpx.AsyncClient) -> dict
         return {"error": str(e)}
 
 
-async def check_ssl_info(domain: str, client: httpx.AsyncClient) -> dict:
-    """Check live SSL certificate directly from the domain."""
-    try:
-        import ssl
-        import socket
-
-        context = ssl.create_default_context()
-        loop = asyncio.get_event_loop()
-
-        def get_cert():
-            with socket.create_connection((domain, 443), timeout=10) as sock:
-                with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                    return ssock.getpeercert()
-
-        cert = await loop.run_in_executor(None, get_cert)
-
-        issuer = dict(x[0] for x in cert.get("issuer", []))
-        subject = dict(x[0] for x in cert.get("subject", []))
-        not_after = cert.get("notAfter", "")
-        not_before = cert.get("notBefore", "")
-
-        days_remaining = None
-        if not_after:
-            from datetime import datetime
-            expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-            days_remaining = (expiry - datetime.utcnow()).days
-
-        return {
-            "has_ssl": True,
-            "issuer": issuer.get("organizationName", issuer.get("commonName", "Unknown")),
-            "issued_to": subject.get("commonName", domain),
-            "not_before": not_before,
-            "not_after": not_after,
-            "days_remaining": days_remaining,
-            "expired": days_remaining < 0 if days_remaining is not None else False,
-            "self_signed": issuer.get("commonName") == subject.get("commonName"),
-        }
-    except ssl.SSLCertVerificationError as e:
-        return {"has_ssl": True, "error": f"SSL verification failed: {str(e)}", "self_signed": True}
-    except Exception as e:
-        return {"has_ssl": False, "error": str(e)}
-
-
 async def check_urlscan(domain: str, client: httpx.AsyncClient) -> dict:
-    """Submit domain to URLScan.io and get live page analysis — free, no key needed for basic use."""
+    """Search URLScan.io for live page analysis — free, no key needed."""
     try:
-        # First search for existing scans of this domain
         r = await client.get(
-            f"https://urlscan.io/api/v1/search/",
+            "https://urlscan.io/api/v1/search/",
             params={"q": f"domain:{domain}", "size": 1},
             headers={"User-Agent": "DigitalDetective/1.0"},
             timeout=10,
         )
-        data = r.json()
-        results = data.get("results", [])
+        results = r.json().get("results", [])
         if not results:
-            return {"found": False, "note": "No previous scans found for this domain"}
+            return {"found": False, "note": "No previous scans found"}
 
         latest = results[0]
         page = latest.get("page", {})
@@ -289,7 +278,6 @@ async def check_urlscan(domain: str, client: httpx.AsyncClient) -> dict:
 
         return {
             "found": True,
-            "screenshot": latest.get("screenshot", ""),
             "ip": page.get("ip", "Unknown"),
             "country": page.get("country", "Unknown"),
             "server": page.get("server", "Unknown"),
@@ -302,80 +290,25 @@ async def check_urlscan(domain: str, client: httpx.AsyncClient) -> dict:
         }
     except Exception as e:
         return {"error": str(e)}
-    """Check live SSL certificate directly from the domain — no third party needed."""
-    try:
-        import ssl
-        import socket
-        from datetime import datetime
 
-        context = ssl.create_default_context()
-        loop = asyncio.get_event_loop()
-
-        def get_cert():
-            with socket.create_connection((domain, 443), timeout=10) as sock:
-                with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                    cert = ssock.getpeercert()
-                    return cert
-
-        cert = await loop.run_in_executor(None, get_cert)
-
-        issuer = dict(x[0] for x in cert.get("issuer", []))
-        subject = dict(x[0] for x in cert.get("subject", []))
-        not_after = cert.get("notAfter", "")
-        not_before = cert.get("notBefore", "")
-
-        expiry = None
-        days_remaining = None
-        if not_after:
-            expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-            days_remaining = (expiry - datetime.utcnow()).days
-
-        return {
-            "has_ssl": True,
-            "issuer": issuer.get("organizationName", issuer.get("commonName", "Unknown")),
-            "issued_to": subject.get("commonName", domain),
-            "not_before": not_before,
-            "not_after": not_after,
-            "days_remaining": days_remaining,
-            "expired": days_remaining < 0 if days_remaining is not None else False,
-            "self_signed": issuer.get("commonName") == subject.get("commonName"),
-        }
-    except ssl.SSLCertVerificationError as e:
-        return {"has_ssl": True, "error": f"SSL verification failed: {str(e)}", "self_signed": True}
-    except Exception as e:
-        return {"has_ssl": False, "error": str(e)}
-
-
-# ── Claude synthesis ──────────────────────────────────────────────────────────
 
 async def check_trustpilot(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search Trustpilot for business reviews and rating — direct approach, no API key needed."""
+    """Search Trustpilot for business reviews and rating."""
     try:
         brand = domain.rsplit(".", 1)[0]
         r = await client.get(
             f"https://www.trustpilot.com/api/categoriespages/find-business",
             params={"query": brand},
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "application/json",
-            },
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
             timeout=10,
         )
         if r.status_code != 200:
-            # Fallback: try the consumer API
-            r2 = await client.get(
-                f"https://www.trustpilot.com/search?query={brand}",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=10,
-            )
-            return {"found": False, "note": f"Trustpilot returned {r.status_code}"}
+            return {"found": False, "note": f"No Trustpilot listing found"}
 
-        data = r.json()
-        businesses = data.get("businesses", [])
+        businesses = r.json().get("businesses", [])
         if not businesses:
             return {"found": False, "note": "No Trustpilot listing found"}
 
-        # Find closest match to our domain
         match = None
         for b in businesses:
             website = b.get("websiteUrl", "").lower()
@@ -385,16 +318,14 @@ async def check_trustpilot(domain: str, client: httpx.AsyncClient) -> dict:
         if not match:
             match = businesses[0]
 
-        stars = match.get("stars", 0)
         review_count = match.get("numberOfReviews", {})
         total_reviews = review_count.get("total", 0) if isinstance(review_count, dict) else review_count
-        trust_score = match.get("trustScore", 0)
 
         return {
             "found": True,
             "name": match.get("displayName", ""),
-            "stars": stars,
-            "trust_score": trust_score,
+            "stars": match.get("stars", 0),
+            "trust_score": match.get("trustScore", 0),
             "total_reviews": total_reviews,
             "url": f"https://www.trustpilot.com/review/{match.get('identifyingName', '')}",
             "claimed": match.get("claimed", False),
@@ -403,13 +334,12 @@ async def check_trustpilot(domain: str, client: httpx.AsyncClient) -> dict:
         return {"error": str(e)}
 
 
-
 async def check_bulgarian_registry(domain: str, client: httpx.AsyncClient) -> dict:
     """Scrape Bulgarian business registries — brra.bg (official) and papagal.bg (owner lookup)."""
     try:
         brand = domain.rsplit(".", 1)[0].replace("-", " ")
 
-        # ── brra.bg — Official Bulgarian Commercial Register ──────────────
+        # brra.bg — Official Bulgarian Commercial Register
         brra_r = await client.get(
             "https://brra.bg/GetDaoo.do",
             params={"uic": "", "companyName": brand, "fromDate": "", "toDate": ""},
@@ -426,15 +356,12 @@ async def check_bulgarian_registry(domain: str, client: httpx.AsyncClient) -> di
         brra_companies = []
         if brra_r.status_code == 200:
             text = brra_r.text
-            # Look for company entries in the response
             if brand.lower() in text.lower() or "ЕИК" in text or "UIC" in text.upper():
                 brra_found = True
-                # Extract basic info if present
-                import re
                 companies = re.findall(r'class="company-name"[^>]*>([^<]+)<', text)
                 brra_companies = companies[:5] if companies else ["Record found — check brra.bg for full details"]
 
-        # ── papagal.bg — Owner & connected businesses lookup ─────────────
+        # papagal.bg — Owner & connected businesses lookup
         papagal_r = await client.get(
             f"https://papagal.bg/search?q={brand}",
             headers={
@@ -452,8 +379,6 @@ async def check_bulgarian_registry(domain: str, client: httpx.AsyncClient) -> di
             text = papagal_r.text
             if brand.lower() in text.lower():
                 papagal_found = True
-                import re
-                # Extract owner names if present
                 owners = re.findall(r'class="person-name"[^>]*>([^<]+)<', text)
                 companies = re.findall(r'class="company-title"[^>]*>([^<]+)<', text)
                 papagal_data = {
@@ -473,13 +398,14 @@ async def check_bulgarian_registry(domain: str, client: httpx.AsyncClient) -> di
                 "data": papagal_data,
                 "url": f"https://papagal.bg/search?q={brand}",
             },
-            "note": "Bulgarian registry check — covers official commercial register and owner network"
         }
     except Exception as e:
         return {"error": str(e)}
 
 
+# ── Claude Synthesis ──────────────────────────────────────────────────────────
 
+async def synthesize_with_claude(target: str, all_data: dict) -> dict:
     """Send all raw intelligence to Claude for plain-English analysis."""
     if not ANTHROPIC_KEY:
         raise HTTPException(status_code=500, detail="No Anthropic API key configured")
@@ -504,11 +430,14 @@ Respond ONLY with a valid JSON object (no markdown, no preamble):
     "Malware Flags": "<value>",
     "Reddit Signals": "<value>",
     "Business Record": "<value>",
-    "Google Safe Browsing": "<value>"
+    "Google Safe Browsing": "<value>",
+    "Trustpilot": "<value>",
+    "URLScan": "<value>",
+    "Bulgarian Registry": "<value>"
   }}
 }}
 
-Be honest. If something looks like a scam, say so clearly. If safe, say that too."""
+Be honest and direct. If something looks like a scam, say so clearly. If safe, say that too."""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -520,12 +449,11 @@ Be honest. If something looks like a scam, say so clearly. If safe, say that too
             },
             json={
                 "model": "claude-sonnet-4-6",
-                "max_tokens": 1200,
+                "max_tokens": 1500,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=30,
         )
-    import json
     response_json = r.json()
     if "error" in response_json:
         raise HTTPException(status_code=500, detail=f"Claude API error: {response_json['error']}")
@@ -533,15 +461,10 @@ Be honest. If something looks like a scam, say so clearly. If safe, say that too
     return json.loads(text.replace("```json", "").replace("```", "").strip())
 
 
-# ── Main endpoint ─────────────────────────────────────────────────────────────
+# ── Main Endpoint ─────────────────────────────────────────────────────────────
 
 @app.post("/investigate", response_model=InvestigateResponse)
 async def investigate(req: InvestigateRequest):
-    import traceback
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
-
     try:
         domain = clean_domain(req.target)
         logger.info(f"Investigating domain: {domain}")
@@ -602,7 +525,6 @@ async def health():
     return {"status": "The detective is on duty", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-# ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
