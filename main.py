@@ -223,7 +223,42 @@ async def search_reddit_mentions(domain: str, client: httpx.AsyncClient) -> dict
         return {"error": str(e)}
 
 
-async def check_ssl_info(domain: str, client: httpx.AsyncClient) -> dict:
+async def check_urlscan(domain: str, client: httpx.AsyncClient) -> dict:
+    """Submit domain to URLScan.io and get live page analysis — free, no key needed for basic use."""
+    try:
+        # First search for existing scans of this domain
+        r = await client.get(
+            f"https://urlscan.io/api/v1/search/",
+            params={"q": f"domain:{domain}", "size": 1},
+            headers={"User-Agent": "DigitalDetective/1.0"},
+            timeout=10,
+        )
+        data = r.json()
+        results = data.get("results", [])
+        if not results:
+            return {"found": False, "note": "No previous scans found for this domain"}
+
+        latest = results[0]
+        page = latest.get("page", {})
+        verdicts = latest.get("verdicts", {})
+        overall = verdicts.get("overall", {})
+        task = latest.get("task", {})
+
+        return {
+            "found": True,
+            "screenshot": latest.get("screenshot", ""),
+            "ip": page.get("ip", "Unknown"),
+            "country": page.get("country", "Unknown"),
+            "server": page.get("server", "Unknown"),
+            "malicious": overall.get("malicious", False),
+            "score": overall.get("score", 0),
+            "categories": overall.get("categories", []),
+            "tags": latest.get("tags", []),
+            "scan_date": task.get("time", ""),
+            "report_url": f"https://urlscan.io/result/{latest.get('_id', '')}/",
+        }
+    except Exception as e:
+        return {"error": str(e)}
     """Check live SSL certificate directly from the domain — no third party needed."""
     try:
         import ssl
@@ -345,10 +380,11 @@ async def investigate(req: InvestigateRequest):
                 check_ssl_info(domain, client),
                 check_gleif(domain, client) if req.include_business else asyncio.sleep(0),
                 search_reddit_mentions(domain, client) if req.include_reddit else asyncio.sleep(0),
+                check_urlscan(domain, client),
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data = results
+        whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data, urlscan_data = results
         logger.info(f"Data collected. WHOIS: {whois_data}, VT: {vt_data}, GSB: {gsb_data}")
 
         all_intelligence = {
@@ -359,6 +395,7 @@ async def investigate(req: InvestigateRequest):
             "ssl": ssl_data,
             "business_records": corp_data,
             "community_signals": reddit_data,
+            "urlscan": urlscan_data,
         }
 
         logger.info("Calling Claude for analysis...")
