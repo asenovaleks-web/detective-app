@@ -45,7 +45,6 @@ VIRUSTOTAL_KEY      = os.getenv("VIRUSTOTAL_API_KEY", "")
 WHOISXML_KEY        = os.getenv("WHOISXML_API_KEY", "")
 GOOGLE_SB_KEY       = os.getenv("GOOGLE_SAFE_BROWSING_KEY", "")
 ANTHROPIC_KEY       = os.getenv("ANTHROPIC_API_KEY", "")
-OPENCORP_API        = "https://api.opencorporates.com/v0.4"
 
 
 # ── Request / Response models ─────────────────────────────────────────────────
@@ -157,31 +156,40 @@ async def check_google_safe_browsing(domain: str, client: httpx.AsyncClient) -> 
         return {"error": str(e)}
 
 
-async def check_opencorporates(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search OpenCorporates for company records matching this domain/brand."""
+async def check_gleif(domain: str, client: httpx.AsyncClient) -> dict:
+    """Search GLEIF for Legal Entity Identifiers — covers 200+ countries, no API key needed."""
     try:
-        # Strip TLD for company name search
         brand = domain.rsplit(".", 1)[0].replace("-", " ")
         r = await client.get(
-            f"{OPENCORP_API}/companies/search",
-            params={"q": brand, "per_page": 5},
+            "https://api.gleif.org/api/v1/fuzzycompletions",
+            params={"field": "entity.legalName", "q": brand},
             timeout=10,
         )
         data = r.json()
-        companies = data.get("results", {}).get("companies", [])
+        entities = data.get("data", [])
         results = []
-        for c in companies:
-            co = c.get("company", {})
+        for e in entities[:5]:
+            attr = e.get("attributes", {})
             results.append({
-                "name": co.get("name"),
-                "jurisdiction": co.get("jurisdiction_code"),
-                "status": co.get("current_status"),
-                "incorporation_date": co.get("incorporation_date"),
-                "opencorporates_url": co.get("opencorporates_url"),
+                "name": attr.get("value", ""),
+                "lei": e.get("id", ""),
             })
+
+        # Also check OpenSanctions — free global sanctions database
+        sanctions_r = await client.get(
+            "https://api.opensanctions.org/search/default",
+            params={"q": brand, "limit": 5},
+            timeout=10,
+        )
+        sanctions_data = sanctions_r.json()
+        sanctions_hits = sanctions_data.get("results", [])
+        sanctioned = [s for s in sanctions_hits if s.get("score", 0) > 0.7]
+
         return {
             "found": len(results) > 0,
             "companies": results,
+            "sanctions_hits": len(sanctioned),
+            "sanctioned_entities": [s.get("caption", "") for s in sanctioned[:3]],
         }
     except Exception as e:
         return {"error": str(e)}
@@ -315,7 +323,7 @@ async def investigate(req: InvestigateRequest):
                 check_virustotal(domain, client),
                 check_google_safe_browsing(domain, client),
                 check_ssl_info(domain, client),
-                check_opencorporates(domain, client) if req.include_business else asyncio.sleep(0),
+                check_gleif(domain, client) if req.include_business else asyncio.sleep(0),
                 search_reddit_mentions(domain, client) if req.include_reddit else asyncio.sleep(0),
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
