@@ -404,37 +404,45 @@ async def check_bulgarian_registry(domain: str, client: httpx.AsyncClient) -> di
 
 
 async def check_companies_house(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search UK Companies House — free, no API key needed for basic search."""
+    """Search UK Companies House via public search — no API key needed."""
     try:
         brand = domain.rsplit(".", 1)[0].replace("-", " ")
+
+        # Use the public search endpoint which doesn't require auth
         r = await client.get(
-            "https://api.company-information.service.gov.uk/search/companies",
-            params={"q": brand, "items_per_page": 5},
-            headers={"User-Agent": "DigitalDetective/1.0"},
-            timeout=10,
+            f"https://find-and-update.company-information.service.gov.uk/search?q={brand}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            timeout=15,
+            follow_redirects=True,
         )
+
         if r.status_code != 200:
             return {"found": False, "note": f"Companies House returned {r.status_code}"}
 
-        data = r.json()
-        items = data.get("items", [])
-        results = []
-        for c in items[:5]:
-            results.append({
-                "name": c.get("title", ""),
-                "company_number": c.get("company_number", ""),
-                "status": c.get("company_status", ""),
-                "type": c.get("company_type", ""),
-                "date_of_creation": c.get("date_of_creation", ""),
-                "url": f"https://find-and-update.company-information.service.gov.uk/company/{c.get('company_number', '')}",
+        text = r.text
+        # Extract company names and numbers from HTML
+        names = re.findall(r'class="govuk-link"[^>]*>([^<]+)</a>', text)
+        numbers = re.findall(r'Company number</dt>\s*<dd[^>]*>([^<]+)</dd>', text)
+        statuses = re.findall(r'class="govuk-tag[^"]*"[^>]*>([^<]+)</span>', text)
+
+        companies = []
+        for i, name in enumerate(names[:5]):
+            companies.append({
+                "name": name.strip(),
+                "company_number": numbers[i].strip() if i < len(numbers) else "",
+                "status": statuses[i].strip() if i < len(statuses) else "Unknown",
             })
 
-        dissolved = [c for c in results if c.get("status") == "dissolved"]
+        dissolved = [c for c in companies if "dissolved" in c.get("status", "").lower()]
 
         return {
-            "found": len(results) > 0,
-            "companies": results,
+            "found": len(companies) > 0,
+            "companies": companies,
             "dissolved_count": len(dissolved),
+            "search_url": f"https://find-and-update.company-information.service.gov.uk/search?q={brand}",
             "note": "UK Companies House — official registry"
         }
     except Exception as e:
