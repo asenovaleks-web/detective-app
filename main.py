@@ -175,21 +175,20 @@ async def check_gleif(domain: str, client: httpx.AsyncClient) -> dict:
                 "lei": e.get("id", ""),
             })
 
-        # Also check OpenSanctions — free global sanctions database
-        sanctions_r = await client.get(
-            "https://api.opensanctions.org/search/default",
-            params={"q": brand, "limit": 5},
+        # Check OFAC sanctions list — US Treasury, free, no key needed
+        ofac_r = await client.get(
+            "https://api.ofac-api.com/v4/search",
+            params={"apiKey": "free", "name": brand, "minScore": 80},
             timeout=10,
         )
-        sanctions_data = sanctions_r.json()
-        sanctions_hits = sanctions_data.get("results", [])
-        sanctioned = [s for s in sanctions_hits if s.get("score", 0) > 0.7]
+        ofac_data = ofac_r.json() if ofac_r.status_code == 200 else {}
+        sanctions_hits = ofac_data.get("results", [])
 
         return {
             "found": len(results) > 0,
             "companies": results,
-            "sanctions_hits": len(sanctioned),
-            "sanctioned_entities": [s.get("caption", "") for s in sanctioned[:3]],
+            "sanctions_hits": len(sanctions_hits),
+            "sanctioned_entities": [s.get("name", "") for s in sanctions_hits[:3]],
         }
     except Exception as e:
         return {"error": str(e)}
