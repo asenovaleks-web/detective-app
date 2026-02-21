@@ -30,7 +30,7 @@ app = FastAPI(title="The Digital Detective API", version="0.1.0")
 # Allow your React frontend to call this
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://your-frontend.vercel.app"],
+   allow_origins=["http://localhost:3000", "https://detective-frontend-umber.vercel.app"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
