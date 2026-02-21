@@ -176,9 +176,9 @@ async def check_gleif(domain: str, client: httpx.AsyncClient) -> dict:
             })
 
         # Check OFAC sanctions list — US Treasury, free, no key needed
-        ofac_r = await client.get(
+        ofac_r = await client.post(
             "https://api.ofac-api.com/v4/search",
-            params={"apiKey": "free", "name": brand, "minScore": 80},
+            json={"apiKey": "free", "cases": [{"names": [{"name": brand}]}], "minScore": 80},
             timeout=10,
         )
         ofac_data = ofac_r.json() if ofac_r.status_code == 200 else {}
@@ -195,14 +195,16 @@ async def check_gleif(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 async def search_reddit_mentions(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search Reddit for scam/complaint mentions via Pushshift-style query."""
+    """Search Reddit for scam/complaint mentions."""
     try:
         brand = domain.rsplit(".", 1)[0]
-        # Use Reddit's public JSON search (no auth needed for basic search)
         r = await client.get(
             "https://www.reddit.com/search.json",
             params={"q": f"{brand} scam OR review OR fraud OR complaint", "limit": 10, "sort": "relevance"},
-            headers={"User-Agent": "DigitalDetective/0.1"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+            },
             timeout=10,
         )
         data = r.json()
