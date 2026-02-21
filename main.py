@@ -404,6 +404,7 @@ async def check_trustpilot(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 
+async def synthesize_with_claude(target: str, all_data: dict) -> dict:
     """Send all raw intelligence to Claude for plain-English analysis."""
     if not ANTHROPIC_KEY:
         raise HTTPException(status_code=500, detail="No Anthropic API key configured")
