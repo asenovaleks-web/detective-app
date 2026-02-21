@@ -403,7 +403,166 @@ async def check_bulgarian_registry(domain: str, client: httpx.AsyncClient) -> di
         return {"error": str(e)}
 
 
-async def check_companies_house(domain: str, client: httpx.AsyncClient) -> dict:
+async def check_wayback_machine(domain: str, client: httpx.AsyncClient) -> dict:
+    """Check Wayback Machine for site history — free, no key needed."""
+    try:
+        r = await client.get(
+            f"https://archive.org/wayback/available?url={domain}",
+            headers={"User-Agent": "DigitalDetective/1.0"},
+            timeout=10,
+        )
+        data = r.json()
+        snapshot = data.get("archived_snapshots", {}).get("closest", {})
+
+        # Also get the CDX API for first ever snapshot
+        r2 = await client.get(
+            f"https://web.archive.org/cdx/search/cdx?url={domain}&output=json&limit=1&fl=timestamp,statuscode&from=19900101&to=20301231&filter=statuscode:200",
+            headers={"User-Agent": "DigitalDetective/1.0"},
+            timeout=10,
+        )
+        first_seen = None
+        first_seen_age_days = None
+        try:
+            cdx_data = r2.json()
+            if len(cdx_data) > 1:  # First row is headers
+                timestamp = cdx_data[1][0]  # Format: YYYYMMDDHHMMSS
+                first_seen = f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}"
+                first_seen_dt = datetime.strptime(first_seen, "%Y-%m-%d")
+                first_seen_age_days = (datetime.now() - first_seen_dt).days
+        except Exception:
+            pass
+
+        return {
+            "found": bool(snapshot),
+            "latest_snapshot": snapshot.get("timestamp", ""),
+            "latest_url": snapshot.get("url", ""),
+            "first_seen": first_seen,
+            "first_seen_age_days": first_seen_age_days,
+            "note": "Wayback Machine — internet archive history"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_icij_offshore(domain: str, client: httpx.AsyncClient) -> dict:
+    """Search ICIJ Offshore Leaks database — Panama Papers, Pandora Papers, free."""
+    try:
+        brand = domain.rsplit(".", 1)[0].replace("-", " ")
+        r = await client.get(
+            "https://offshoreleaks.icij.org/search",
+            params={"q": brand, "c": "", "j": "", "d": ""},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            timeout=15,
+            follow_redirects=True,
+        )
+
+        hits = []
+        if r.status_code == 200:
+            text = r.text
+            # Extract results
+            names = re.findall(r'class="link-text">([^<]+)</span>', text)
+            types = re.findall(r'class="result-type[^"]*">([^<]+)<', text)
+            jurisdictions = re.findall(r'class="jurisdiction[^"]*">([^<]+)<', text)
+
+            for i, name in enumerate(names[:5]):
+                hits.append({
+                    "name": name.strip(),
+                    "type": types[i].strip() if i < len(types) else "",
+                    "jurisdiction": jurisdictions[i].strip() if i < len(jurisdictions) else "",
+                })
+
+        return {
+            "found": len(hits) > 0,
+            "hits": hits,
+            "search_url": f"https://offshoreleaks.icij.org/search?q={brand}",
+            "note": "ICIJ Offshore Leaks — Panama Papers, Pandora Papers, FinCEN Files"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_bbb(domain: str, client: httpx.AsyncClient) -> dict:
+    """Search Better Business Bureau for US complaints and accreditation."""
+    try:
+        brand = domain.rsplit(".", 1)[0].replace("-", " ")
+        r = await client.get(
+            f"https://www.bbb.org/search?find_text={brand}&find_country=USA",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            timeout=15,
+            follow_redirects=True,
+        )
+
+        found = False
+        businesses = []
+        if r.status_code == 200:
+            text = r.text
+            names = re.findall(r'class="bds-h4 dtm-business-name[^"]*">([^<]+)<', text)
+            ratings = re.findall(r'BBB Rating</span>[^>]*>([^<]+)<', text)
+            accredited = "BBB Accredited" in text
+
+            for i, name in enumerate(names[:3]):
+                businesses.append({
+                    "name": name.strip(),
+                    "rating": ratings[i].strip() if i < len(ratings) else "Not rated",
+                })
+            found = len(businesses) > 0
+
+        return {
+            "found": found,
+            "businesses": businesses,
+            "search_url": f"https://www.bbb.org/search?find_text={brand}",
+            "note": "Better Business Bureau — US complaints and accreditation"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_shodan(domain: str, client: httpx.AsyncClient) -> dict:
+    """Check Shodan for server infrastructure info — free public search."""
+    try:
+        r = await client.get(
+            f"https://internetdb.shodan.io/{domain}",
+            headers={"User-Agent": "DigitalDetective/1.0"},
+            timeout=10,
+        )
+
+        if r.status_code == 404:
+            # Try resolving domain to IP first
+            return {"found": False, "note": "No Shodan data for this domain"}
+
+        if r.status_code != 200:
+            return {"found": False, "note": f"Shodan returned {r.status_code}"}
+
+        data = r.json()
+        open_ports = data.get("ports", [])
+        vulns = data.get("vulns", [])
+        tags = data.get("tags", [])
+        hostnames = data.get("hostnames", [])
+        cpes = data.get("cpes", [])
+
+        suspicious_ports = [p for p in open_ports if p in [21, 23, 25, 3389, 4444, 5900, 8443]]
+
+        return {
+            "found": True,
+            "open_ports": open_ports,
+            "suspicious_ports": suspicious_ports,
+            "vulnerabilities": vulns,
+            "tags": tags,
+            "hostnames": hostnames[:5],
+            "software": cpes[:5],
+            "note": "Shodan InternetDB — server infrastructure scan"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+
     """Search UK Companies House via public search — no API key needed."""
     try:
         brand = domain.rsplit(".", 1)[0].replace("-", " ")
@@ -521,7 +680,11 @@ Respond ONLY with a valid JSON object (no markdown, no preamble):
     "URLScan": "<value>",
     "Bulgarian Registry": "<value>",
     "UK Companies House": "<value>",
-    "SEC EDGAR": "<value>"
+    "SEC EDGAR": "<value>",
+    "Wayback Machine": "<value>",
+    "ICIJ Offshore Leaks": "<value>",
+    "BBB": "<value>",
+    "Shodan": "<value>"
   }}
 }}
 
@@ -570,10 +733,14 @@ async def investigate(req: InvestigateRequest):
                 check_bulgarian_registry(domain, client),
                 check_companies_house(domain, client),
                 check_sec_edgar(domain, client),
+                check_wayback_machine(domain, client),
+                check_icij_offshore(domain, client),
+                check_bbb(domain, client),
+                check_shodan(domain, client),
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data, urlscan_data, trustpilot_data, bulgarian_data, uk_data, sec_data = results
+        whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data, urlscan_data, trustpilot_data, bulgarian_data, uk_data, sec_data, wayback_data, icij_data, bbb_data, shodan_data = results
         logger.info(f"Data collected. WHOIS: {whois_data}, VT: {vt_data}, GSB: {gsb_data}")
 
         all_intelligence = {
@@ -589,6 +756,10 @@ async def investigate(req: InvestigateRequest):
             "bulgarian_registry": bulgarian_data,
             "uk_companies_house": uk_data,
             "sec_edgar": sec_data,
+            "wayback_machine": wayback_data,
+            "icij_offshore_leaks": icij_data,
+            "bbb": bbb_data,
+            "shodan": shodan_data,
         }
 
         logger.info("Calling Claude for analysis...")
