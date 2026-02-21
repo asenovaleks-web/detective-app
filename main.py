@@ -30,7 +30,7 @@ app = FastAPI(title="The Digital Detective API", version="0.1.0")
 # Allow your React frontend to call this
 app.add_middleware(
     CORSMiddleware,
-   allow_origins=["http://localhost:3000", "https://detective-frontend-umber.vercel.app"],
+    allow_origins=["http://localhost:3000", "https://your-frontend.vercel.app"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -292,45 +292,58 @@ Be honest. If something looks like a scam, say so clearly. If safe, say that too
 
 @app.post("/investigate", response_model=InvestigateResponse)
 async def investigate(req: InvestigateRequest):
-    domain = clean_domain(req.target)
+    import traceback
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
 
-    async with httpx.AsyncClient() as client:
-        # Fire all data sources simultaneously
-        tasks = [
-            check_whoisxml(domain, client),
-            check_virustotal(domain, client),
-            check_google_safe_browsing(domain, client),
-            check_ssl_info(domain, client),
-            check_opencorporates(domain, client) if req.include_business else asyncio.sleep(0),
-            search_reddit_mentions(domain, client) if req.include_reddit else asyncio.sleep(0),
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        domain = clean_domain(req.target)
+        logger.info(f"Investigating domain: {domain}")
 
-    whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data = results
+        async with httpx.AsyncClient() as client:
+            tasks = [
+                check_whoisxml(domain, client),
+                check_virustotal(domain, client),
+                check_google_safe_browsing(domain, client),
+                check_ssl_info(domain, client),
+                check_opencorporates(domain, client) if req.include_business else asyncio.sleep(0),
+                search_reddit_mentions(domain, client) if req.include_reddit else asyncio.sleep(0),
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    all_intelligence = {
-        "target": domain,
-        "whois": whois_data,
-        "virustotal": vt_data,
-        "google_safe_browsing": gsb_data,
-        "ssl": ssl_data,
-        "business_records": corp_data,
-        "community_signals": reddit_data,
-    }
+        whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data = results
+        logger.info(f"Data collected. WHOIS: {whois_data}, VT: {vt_data}, GSB: {gsb_data}")
 
-    # Claude synthesizes everything
-    analysis = await synthesize_with_claude(req.target, all_intelligence)
+        all_intelligence = {
+            "target": domain,
+            "whois": whois_data,
+            "virustotal": vt_data,
+            "google_safe_browsing": gsb_data,
+            "ssl": ssl_data,
+            "business_records": corp_data,
+            "community_signals": reddit_data,
+        }
 
-    return InvestigateResponse(
-        target=req.target,
-        score=analysis.get("score", 50),
-        verdict=analysis.get("verdict", "YELLOW"),
-        verdict_summary=analysis.get("verdict_summary", ""),
-        findings=analysis.get("findings", []),
-        narrative=analysis.get("narrative", ""),
-        raw_labels=analysis.get("raw_labels", {}),
-        raw_data=all_intelligence,
-    )
+        logger.info("Calling Claude for analysis...")
+        analysis = await synthesize_with_claude(req.target, all_intelligence)
+        logger.info(f"Claude response: {analysis}")
+
+        return InvestigateResponse(
+            target=req.target,
+            score=analysis.get("score", 50),
+            verdict=analysis.get("verdict", "YELLOW"),
+            verdict_summary=analysis.get("verdict_summary", ""),
+            findings=analysis.get("findings", []),
+            narrative=analysis.get("narrative", ""),
+            raw_labels=analysis.get("raw_labels", {}),
+            raw_data=all_intelligence,
+        )
+
+    except Exception as e:
+        logger.error(f"Investigation failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
