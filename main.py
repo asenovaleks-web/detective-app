@@ -403,6 +403,84 @@ async def check_bulgarian_registry(domain: str, client: httpx.AsyncClient) -> di
         return {"error": str(e)}
 
 
+async def check_companies_house(domain: str, client: httpx.AsyncClient) -> dict:
+    """Search UK Companies House — free, no API key needed for basic search."""
+    try:
+        brand = domain.rsplit(".", 1)[0].replace("-", " ")
+        r = await client.get(
+            "https://api.company-information.service.gov.uk/search/companies",
+            params={"q": brand, "items_per_page": 5},
+            headers={"User-Agent": "DigitalDetective/1.0"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return {"found": False, "note": f"Companies House returned {r.status_code}"}
+
+        data = r.json()
+        items = data.get("items", [])
+        results = []
+        for c in items[:5]:
+            results.append({
+                "name": c.get("title", ""),
+                "company_number": c.get("company_number", ""),
+                "status": c.get("company_status", ""),
+                "type": c.get("company_type", ""),
+                "date_of_creation": c.get("date_of_creation", ""),
+                "url": f"https://find-and-update.company-information.service.gov.uk/company/{c.get('company_number', '')}",
+            })
+
+        dissolved = [c for c in results if c.get("status") == "dissolved"]
+
+        return {
+            "found": len(results) > 0,
+            "companies": results,
+            "dissolved_count": len(dissolved),
+            "note": "UK Companies House — official registry"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_sec_edgar(domain: str, client: httpx.AsyncClient) -> dict:
+    """Search SEC EDGAR for US company filings — free, no API key needed."""
+    try:
+        brand = domain.rsplit(".", 1)[0].replace("-", " ")
+        r = await client.get(
+            "https://efts.sec.gov/LATEST/search-index?q=%22{brand}%22&dateRange=custom&startdt=2000-01-01&forms=10-K,S-1,8-K".format(brand=brand),
+            headers={"User-Agent": "DigitalDetective/1.0 contact@digitaldetective.app"},
+            timeout=10,
+        )
+
+        # Also search the company search endpoint
+        r2 = await client.get(
+            f"https://www.sec.gov/cgi-bin/browse-edgar?company={brand}&CIK=&type=&dateb=&owner=include&count=10&search_text=&action=getcompany&output=atom",
+            headers={"User-Agent": "DigitalDetective/1.0 contact@digitaldetective.app"},
+            timeout=10,
+        )
+
+        found = False
+        companies = []
+        if r2.status_code == 200:
+            text = r2.text
+            names = re.findall(r'<company-name>([^<]+)</company-name>', text)
+            ciks = re.findall(r'<CIK>([^<]+)</CIK>', text)
+            for name, cik in zip(names[:5], ciks[:5]):
+                companies.append({
+                    "name": name.strip(),
+                    "cik": cik.strip(),
+                    "url": f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik.strip()}"
+                })
+            found = len(companies) > 0
+
+        return {
+            "found": found,
+            "companies": companies,
+            "note": "SEC EDGAR — US Securities and Exchange Commission filings"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ── Claude Synthesis ──────────────────────────────────────────────────────────
 
 async def synthesize_with_claude(target: str, all_data: dict) -> dict:
@@ -433,7 +511,9 @@ Respond ONLY with a valid JSON object (no markdown, no preamble):
     "Google Safe Browsing": "<value>",
     "Trustpilot": "<value>",
     "URLScan": "<value>",
-    "Bulgarian Registry": "<value>"
+    "Bulgarian Registry": "<value>",
+    "UK Companies House": "<value>",
+    "SEC EDGAR": "<value>"
   }}
 }}
 
@@ -480,10 +560,12 @@ async def investigate(req: InvestigateRequest):
                 check_urlscan(domain, client),
                 check_trustpilot(domain, client),
                 check_bulgarian_registry(domain, client),
+                check_companies_house(domain, client),
+                check_sec_edgar(domain, client),
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data, urlscan_data, trustpilot_data, bulgarian_data = results
+        whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data, urlscan_data, trustpilot_data, bulgarian_data, uk_data, sec_data = results
         logger.info(f"Data collected. WHOIS: {whois_data}, VT: {vt_data}, GSB: {gsb_data}")
 
         all_intelligence = {
@@ -497,6 +579,8 @@ async def investigate(req: InvestigateRequest):
             "urlscan": urlscan_data,
             "trustpilot": trustpilot_data,
             "bulgarian_registry": bulgarian_data,
+            "uk_companies_house": uk_data,
+            "sec_edgar": sec_data,
         }
 
         logger.info("Calling Claude for analysis...")
