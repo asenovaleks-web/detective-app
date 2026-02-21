@@ -224,25 +224,48 @@ async def search_reddit_mentions(domain: str, client: httpx.AsyncClient) -> dict
 
 
 async def check_ssl_info(domain: str, client: httpx.AsyncClient) -> dict:
-    """Check SSL certificate info via crt.sh."""
+    """Check live SSL certificate directly from the domain — no third party needed."""
     try:
-        r = await client.get(
-            f"https://crt.sh/?q={domain}&output=json",
-            timeout=10,
-        )
-        certs = r.json()
-        if certs:
-            latest = certs[0]
-            return {
-                "has_ssl": True,
-                "issuer": latest.get("issuer_name", "Unknown"),
-                "not_before": latest.get("not_before", ""),
-                "not_after": latest.get("not_after", ""),
-                "entries_count": len(certs),
-            }
-        return {"has_ssl": False}
+        import ssl
+        import socket
+        from datetime import datetime
+
+        context = ssl.create_default_context()
+        loop = asyncio.get_event_loop()
+
+        def get_cert():
+            with socket.create_connection((domain, 443), timeout=10) as sock:
+                with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                    cert = ssock.getpeercert()
+                    return cert
+
+        cert = await loop.run_in_executor(None, get_cert)
+
+        issuer = dict(x[0] for x in cert.get("issuer", []))
+        subject = dict(x[0] for x in cert.get("subject", []))
+        not_after = cert.get("notAfter", "")
+        not_before = cert.get("notBefore", "")
+
+        expiry = None
+        days_remaining = None
+        if not_after:
+            expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+            days_remaining = (expiry - datetime.utcnow()).days
+
+        return {
+            "has_ssl": True,
+            "issuer": issuer.get("organizationName", issuer.get("commonName", "Unknown")),
+            "issued_to": subject.get("commonName", domain),
+            "not_before": not_before,
+            "not_after": not_after,
+            "days_remaining": days_remaining,
+            "expired": days_remaining < 0 if days_remaining is not None else False,
+            "self_signed": issuer.get("commonName") == subject.get("commonName"),
+        }
+    except ssl.SSLCertVerificationError as e:
+        return {"has_ssl": True, "error": f"SSL verification failed: {str(e)}", "self_signed": True}
     except Exception as e:
-        return {"error": str(e)}
+        return {"has_ssl": False, "error": str(e)}
 
 
 # ── Claude synthesis ──────────────────────────────────────────────────────────
