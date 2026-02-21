@@ -223,6 +223,49 @@ async def search_reddit_mentions(domain: str, client: httpx.AsyncClient) -> dict
         return {"error": str(e)}
 
 
+async def check_ssl_info(domain: str, client: httpx.AsyncClient) -> dict:
+    """Check live SSL certificate directly from the domain."""
+    try:
+        import ssl
+        import socket
+
+        context = ssl.create_default_context()
+        loop = asyncio.get_event_loop()
+
+        def get_cert():
+            with socket.create_connection((domain, 443), timeout=10) as sock:
+                with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                    return ssock.getpeercert()
+
+        cert = await loop.run_in_executor(None, get_cert)
+
+        issuer = dict(x[0] for x in cert.get("issuer", []))
+        subject = dict(x[0] for x in cert.get("subject", []))
+        not_after = cert.get("notAfter", "")
+        not_before = cert.get("notBefore", "")
+
+        days_remaining = None
+        if not_after:
+            from datetime import datetime
+            expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+            days_remaining = (expiry - datetime.utcnow()).days
+
+        return {
+            "has_ssl": True,
+            "issuer": issuer.get("organizationName", issuer.get("commonName", "Unknown")),
+            "issued_to": subject.get("commonName", domain),
+            "not_before": not_before,
+            "not_after": not_after,
+            "days_remaining": days_remaining,
+            "expired": days_remaining < 0 if days_remaining is not None else False,
+            "self_signed": issuer.get("commonName") == subject.get("commonName"),
+        }
+    except ssl.SSLCertVerificationError as e:
+        return {"has_ssl": True, "error": f"SSL verification failed: {str(e)}", "self_signed": True}
+    except Exception as e:
+        return {"has_ssl": False, "error": str(e)}
+
+
 async def check_urlscan(domain: str, client: httpx.AsyncClient) -> dict:
     """Submit domain to URLScan.io and get live page analysis — free, no key needed for basic use."""
     try:
