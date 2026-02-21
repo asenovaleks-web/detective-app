@@ -348,7 +348,62 @@ async def check_urlscan(domain: str, client: httpx.AsyncClient) -> dict:
 
 # ── Claude synthesis ──────────────────────────────────────────────────────────
 
-async def synthesize_with_claude(target: str, all_data: dict) -> dict:
+async def check_trustpilot(domain: str, client: httpx.AsyncClient) -> dict:
+    """Search Trustpilot for business reviews and rating — direct approach, no API key needed."""
+    try:
+        brand = domain.rsplit(".", 1)[0]
+        r = await client.get(
+            f"https://www.trustpilot.com/api/categoriespages/find-business",
+            params={"query": brand},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+            },
+            timeout=10,
+        )
+        if r.status_code != 200:
+            # Fallback: try the consumer API
+            r2 = await client.get(
+                f"https://www.trustpilot.com/search?query={brand}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
+            return {"found": False, "note": f"Trustpilot returned {r.status_code}"}
+
+        data = r.json()
+        businesses = data.get("businesses", [])
+        if not businesses:
+            return {"found": False, "note": "No Trustpilot listing found"}
+
+        # Find closest match to our domain
+        match = None
+        for b in businesses:
+            website = b.get("websiteUrl", "").lower()
+            if brand in website or domain in website:
+                match = b
+                break
+        if not match:
+            match = businesses[0]
+
+        stars = match.get("stars", 0)
+        review_count = match.get("numberOfReviews", {})
+        total_reviews = review_count.get("total", 0) if isinstance(review_count, dict) else review_count
+        trust_score = match.get("trustScore", 0)
+
+        return {
+            "found": True,
+            "name": match.get("displayName", ""),
+            "stars": stars,
+            "trust_score": trust_score,
+            "total_reviews": total_reviews,
+            "url": f"https://www.trustpilot.com/review/{match.get('identifyingName', '')}",
+            "claimed": match.get("claimed", False),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+
     """Send all raw intelligence to Claude for plain-English analysis."""
     if not ANTHROPIC_KEY:
         raise HTTPException(status_code=500, detail="No Anthropic API key configured")
@@ -424,10 +479,11 @@ async def investigate(req: InvestigateRequest):
                 check_gleif(domain, client) if req.include_business else asyncio.sleep(0),
                 search_reddit_mentions(domain, client) if req.include_reddit else asyncio.sleep(0),
                 check_urlscan(domain, client),
+                check_trustpilot(domain, client),
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data, urlscan_data = results
+        whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data, urlscan_data, trustpilot_data = results
         logger.info(f"Data collected. WHOIS: {whois_data}, VT: {vt_data}, GSB: {gsb_data}")
 
         all_intelligence = {
@@ -439,6 +495,7 @@ async def investigate(req: InvestigateRequest):
             "business_records": corp_data,
             "community_signals": reddit_data,
             "urlscan": urlscan_data,
+            "trustpilot": trustpilot_data,
         }
 
         logger.info("Calling Claude for analysis...")
