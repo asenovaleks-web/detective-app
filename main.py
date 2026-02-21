@@ -194,32 +194,29 @@ async def check_gleif(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 async def search_reddit_mentions(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search Reddit for scam/complaint mentions."""
+    """Search Reddit mentions via Pullpush.io — no authentication needed."""
     try:
         brand = domain.rsplit(".", 1)[0]
         r = await client.get(
-            "https://www.reddit.com/search.json",
-            params={"q": f"{brand} scam OR review OR fraud OR complaint", "limit": 10, "sort": "relevance"},
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "application/json",
-            },
+            "https://api.pullpush.io/reddit/search/submission",
+            params={"q": f"{brand} scam OR fraud OR complaint OR review", "size": 10, "sort": "desc"},
+            headers={"User-Agent": "Mozilla/5.0"},
             timeout=10,
         )
         data = r.json()
-        posts = data.get("data", {}).get("children", [])
+        posts = data.get("data", [])
         snippets = []
         for p in posts[:5]:
-            pd = p.get("data", {})
             snippets.append({
-                "title": pd.get("title", ""),
-                "subreddit": pd.get("subreddit", ""),
-                "score": pd.get("score", 0),
-                "url": f"https://reddit.com{pd.get('permalink', '')}",
+                "title": p.get("title", ""),
+                "subreddit": p.get("subreddit", ""),
+                "score": p.get("score", 0),
+                "url": f"https://reddit.com{p.get('permalink', '')}",
             })
+        scam_posts = [p for p in posts if any(w in p.get("title", "").lower() for w in ["scam", "fraud", "fake", "cheat", "stolen"])]
         return {
             "total_found": len(posts),
-            "scam_keyword_posts": len([p for p in posts if any(w in p.get("data", {}).get("title", "").lower() for w in ["scam", "fraud", "fake", "cheat"])]),
+            "scam_keyword_posts": len(scam_posts),
             "sample_posts": snippets,
         }
     except Exception as e:
