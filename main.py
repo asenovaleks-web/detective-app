@@ -1,5 +1,5 @@
 """
-The Digital Detective — FastAPI Backend v3.0
+The Digital Detective — FastAPI Backend v4.0
 =============================================
 Data Sources (20 total):
   1. WhoisXML — domain age & registrant
@@ -28,6 +28,8 @@ Environment variables required:
   VIRUSTOTAL_API_KEY
   WHOISXML_API_KEY
   GOOGLE_SAFE_BROWSING_KEY
+  SUPABASE_URL
+  SUPABASE_SERVICE_KEY
 """
 
 import asyncio
@@ -42,9 +44,10 @@ from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -65,10 +68,14 @@ async def options_investigate():
     return {"status": "ok"}
 
 # ── Config ────────────────────────────────────────────────────────────────────
-VIRUSTOTAL_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
-WHOISXML_KEY   = os.getenv("WHOISXML_API_KEY", "")
-GOOGLE_SB_KEY  = os.getenv("GOOGLE_SAFE_BROWSING_KEY", "")
-ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+VIRUSTOTAL_KEY    = os.getenv("VIRUSTOTAL_API_KEY", "")
+WHOISXML_KEY      = os.getenv("WHOISXML_API_KEY", "")
+GOOGLE_SB_KEY     = os.getenv("GOOGLE_SAFE_BROWSING_KEY", "")
+ANTHROPIC_KEY     = os.getenv("ANTHROPIC_API_KEY", "")
+SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE  = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+FREE_DAILY_LIMIT  = 3
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -76,6 +83,7 @@ class InvestigateRequest(BaseModel):
     target: str
     include_reddit: bool = True
     include_business: bool = True
+    user_token: Optional[str] = None  # Supabase JWT token from frontend
 
 class InvestigateResponse(BaseModel):
     target: str
@@ -95,6 +103,81 @@ def clean_domain(target: str) -> str:
         if target.startswith(prefix):
             target = target[len(prefix):]
     return target.split("/")[0]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUPABASE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def get_user_from_token(token: str) -> Optional[dict]:
+    """Verify Supabase JWT and return user info."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_SERVICE},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                return r.json()
+            return None
+    except Exception:
+        return None
+
+
+async def get_user_plan(user_id: str) -> str:
+    """Get user's current plan from profiles table."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=plan,subscription_status",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data:
+                    profile = data[0]
+                    if profile.get("subscription_status") == "active":
+                        return profile.get("plan", "free")
+            return "free"
+    except Exception:
+        return "free"
+
+
+async def get_daily_count(user_id: str) -> int:
+    """Count investigations in the last 24 hours for this user."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/investigations?user_id=eq.{user_id}&created_at=gte.{datetime.now(timezone.utc).strftime('%Y-%m-%dT00:00:00')}Z&select=id",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                return len(r.json())
+            return 0
+    except Exception:
+        return 0
+
+
+async def log_investigation(user_id: str, domain: str, verdict: str, score: int):
+    """Log an investigation to the database."""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/investigations",
+                headers={
+                    "apikey": SUPABASE_SERVICE,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                json={"user_id": user_id, "domain": domain, "verdict": verdict, "score": score},
+                timeout=10,
+            )
+    except Exception as e:
+        logger.warning(f"Failed to log investigation: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -632,6 +715,27 @@ async def investigate(req: InvestigateRequest):
         domain = clean_domain(req.target)
         logger.info(f"Investigating domain: {domain}")
 
+        # ── User auth & free tier check ───────────────────────────────────
+        user_id = None
+        user_plan = "free"
+
+        if req.user_token and SUPABASE_URL:
+            user = await get_user_from_token(req.user_token)
+            if user:
+                user_id = user.get("id")
+                user_plan = await get_user_plan(user_id)
+
+                if user_plan == "free":
+                    daily_count = await get_daily_count(user_id)
+                    if daily_count >= FREE_DAILY_LIMIT:
+                        raise HTTPException(
+                            status_code=429,
+                            detail=f"Free tier limit reached ({FREE_DAILY_LIMIT} investigations/day). Upgrade to Pro for unlimited investigations."
+                        )
+        elif SUPABASE_URL and not req.user_token:
+            # Anonymous user — allow but don't log
+            pass
+
         async with httpx.AsyncClient() as client:
             tasks = [
                 check_whoisxml(domain, client),              # 0
@@ -691,6 +795,10 @@ async def investigate(req: InvestigateRequest):
         logger.info("Calling Claude for analysis...")
         analysis = await synthesize_with_claude(req.target, all_intelligence)
         logger.info(f"Claude verdict: {analysis.get('verdict')} score: {analysis.get('score')}")
+
+        # ── Log investigation to database ─────────────────────────────────
+        if user_id:
+            await log_investigation(user_id, domain, analysis.get("verdict", ""), analysis.get("score", 0))
 
         return InvestigateResponse(
             target=req.target,
