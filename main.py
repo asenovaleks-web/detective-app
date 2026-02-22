@@ -77,7 +77,7 @@ SUPABASE_SERVICE  = os.getenv("SUPABASE_SERVICE_KEY", "")
 SUPABASE_ANON     = os.getenv("SUPABASE_ANON_KEY", "")
 STRIPE_SECRET     = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK    = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_PRICE_ID   = "price_1T3bAcACEfVvmWmy9B0MDh7Y"
+STRIPE_PRICE_ID   = "price_1T3cu8ACEfVvmWmy3Q6tZGFh"
 FRONTEND_URL      = "https://detective-frontend-umber.vercel.app"
 
 FREE_DAILY_LIMIT  = 3
