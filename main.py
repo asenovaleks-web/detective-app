@@ -442,22 +442,22 @@ async def check_shodan(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 async def check_germany_bundesanzeiger(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search German Federal Gazette — official German company register."""
+    """Search German Handelsregister — official German company register."""
     try:
         brand = domain.rsplit(".", 1)[0].replace("-", " ")
         r = await client.get(
-            "https://www.unternehmensregister.de/ureg/search.do",
-            params={"submitAction": "search", "companyName": brand, "searchType": "company"},
+            "https://www.handelsregister.de/rp_web/mask.do",
+            params={"Typ": "n", "comp.name": brand},
             headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "de,en;q=0.9"},
             timeout=15, follow_redirects=True,
         )
         found = r.status_code == 200 and brand.lower() in r.text.lower()
-        companies = re.findall(r'class="result-company-name[^"]*">([^<]+)<', r.text)[:5] if found else []
+        companies = re.findall(r'<td[^>]*class="[^"]*comp[^"]*"[^>]*>([^<]+)<', r.text)[:5] if found else []
         return {
             "found": found,
-            "companies": companies,
-            "search_url": f"https://www.unternehmensregister.de/ureg/search.do?companyName={brand}",
-            "note": "German Federal Company Register"
+            "companies": [c.strip() for c in companies],
+            "search_url": f"https://www.handelsregister.de/rp_web/mask.do?comp.name={brand}",
+            "note": "German Handelsregister — official company register"
         }
     except Exception as e:
         return {"error": str(e)}
@@ -507,24 +507,30 @@ async def check_canada_corporations(domain: str, client: httpx.AsyncClient) -> d
 
 
 async def check_india_mca(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search India Ministry of Corporate Affairs — MCA21 portal."""
+    """Search India MCA — company search via public portal."""
     try:
         brand = domain.rsplit(".", 1)[0].replace("-", " ")
-        # MCA21 has a public search API
         r = await client.get(
-            "https://www.mca.gov.in/mcafoportal/viewCompanyMasterData.do",
-            params={"companyName": brand},
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/html"},
+            "https://www.mca.gov.in/mcafoportal/getCompanyDetails.do",
+            params={"companyName": brand, "companyCategory": ""},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json, text/javascript, */*",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": "https://www.mca.gov.in/",
+            },
             timeout=15, follow_redirects=True,
         )
-        found = r.status_code == 200 and brand.lower() in r.text.lower()
-        companies = re.findall(r'"companyName"\s*:\s*"([^"]+)"', r.text)[:5] if found else []
-        return {
-            "found": found,
-            "companies": companies,
-            "search_url": "https://www.mca.gov.in/mcafoportal/viewCompanyMasterData.do",
-            "note": "India MCA21 — Ministry of Corporate Affairs"
-        }
+        found = False
+        companies = []
+        if r.status_code == 200:
+            try:
+                data = r.json()
+                companies = [c.get("companyName", "") for c in data.get("companyList", [])[:5]]
+                found = len(companies) > 0
+            except Exception:
+                found = brand.lower() in r.text.lower()
+        return {"found": found, "companies": companies, "note": "India MCA21 — Ministry of Corporate Affairs"}
     except Exception as e:
         return {"error": str(e)}
 
