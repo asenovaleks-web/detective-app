@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -74,6 +74,10 @@ GOOGLE_SB_KEY     = os.getenv("GOOGLE_SAFE_BROWSING_KEY", "")
 ANTHROPIC_KEY     = os.getenv("ANTHROPIC_API_KEY", "")
 SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE  = os.getenv("SUPABASE_SERVICE_KEY", "")
+STRIPE_SECRET     = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK    = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID   = "price_1T3bAcACEfVvmWmy9B0MDh7Y"
+FRONTEND_URL      = "https://detective-frontend-umber.vercel.app"
 
 FREE_DAILY_LIMIT  = 3
 
@@ -820,6 +824,129 @@ async def investigate(req: InvestigateRequest):
 @app.get("/health")
 async def health():
     return {"status": "The detective is on duty", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STRIPE ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CheckoutRequest(BaseModel):
+    user_token: str
+    user_email: str
+
+@app.post("/create-checkout-session")
+async def create_checkout_session(req: CheckoutRequest):
+    """Create a Stripe checkout session for Pro upgrade."""
+    if not STRIPE_SECRET:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    # Verify user
+    user = await get_user_from_token(req.user_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_id = user.get("id")
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://api.stripe.com/v1/checkout/sessions",
+            auth=(STRIPE_SECRET, ""),
+            data={
+                "mode": "subscription",
+                "line_items[0][price]": STRIPE_PRICE_ID,
+                "line_items[0][quantity]": "1",
+                "customer_email": req.user_email,
+                "success_url": f"{FRONTEND_URL}?upgrade=success",
+                "cancel_url": f"{FRONTEND_URL}?upgrade=cancelled",
+                "metadata[user_id]": user_id,
+                "subscription_data[metadata][user_id]": user_id,
+            },
+            timeout=15,
+        )
+    data = r.json()
+    if "error" in data:
+        raise HTTPException(status_code=400, detail=data["error"]["message"])
+
+    return {"checkout_url": data["url"]}
+
+
+@app.post("/webhook")
+async def stripe_webhook(request: Request):
+    """Handle Stripe webhook events — upgrade user plan on successful payment."""
+    from fastapi import Request
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    # Verify webhook signature
+    if STRIPE_WEBHOOK:
+        try:
+            import hmac, hashlib
+            timestamp = sig_header.split("t=")[1].split(",")[0]
+            sig = sig_header.split("v1=")[1].split(",")[0]
+            signed_payload = f"{timestamp}.{payload.decode()}"
+            expected = hmac.new(STRIPE_WEBHOOK.encode(), signed_payload.encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expected, sig):
+                raise HTTPException(status_code=400, detail="Invalid signature")
+        except Exception as e:
+            logger.warning(f"Webhook signature check failed: {e}")
+
+    try:
+        event = json.loads(payload)
+        event_type = event.get("type")
+        logger.info(f"Stripe webhook: {event_type}")
+
+        if event_type in ("checkout.session.completed", "invoice.payment_succeeded"):
+            obj = event.get("data", {}).get("object", {})
+            user_id = obj.get("metadata", {}).get("user_id") or \
+                      obj.get("subscription_details", {}).get("metadata", {}).get("user_id")
+
+            if user_id:
+                await upgrade_user_to_pro(user_id)
+                logger.info(f"Upgraded user {user_id} to Pro")
+
+        elif event_type in ("customer.subscription.deleted", "invoice.payment_failed"):
+            obj = event.get("data", {}).get("object", {})
+            user_id = obj.get("metadata", {}).get("user_id")
+            if user_id:
+                await downgrade_user_to_free(user_id)
+                logger.info(f"Downgraded user {user_id} to free")
+
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+
+    return {"status": "ok"}
+
+
+async def upgrade_user_to_pro(user_id: str):
+    """Set user plan to pro in Supabase."""
+    async with httpx.AsyncClient() as client:
+        await client.patch(
+            f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}",
+            headers={
+                "apikey": SUPABASE_SERVICE,
+                "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            json={"plan": "pro", "subscription_status": "active"},
+            timeout=10,
+        )
+
+
+async def downgrade_user_to_free(user_id: str):
+    """Revert user plan to free in Supabase."""
+    async with httpx.AsyncClient() as client:
+        await client.patch(
+            f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}",
+            headers={
+                "apikey": SUPABASE_SERVICE,
+                "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            json={"plan": "free", "subscription_status": "inactive"},
+            timeout=10,
+        )
 
 
 if __name__ == "__main__":
