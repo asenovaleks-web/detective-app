@@ -74,6 +74,7 @@ GOOGLE_SB_KEY     = os.getenv("GOOGLE_SAFE_BROWSING_KEY", "")
 ANTHROPIC_KEY     = os.getenv("ANTHROPIC_API_KEY", "")
 SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE  = os.getenv("SUPABASE_SERVICE_KEY", "")
+SUPABASE_ANON     = os.getenv("SUPABASE_ANON_KEY", "")
 STRIPE_SECRET     = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK    = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_ID   = "price_1T3bAcACEfVvmWmy9B0MDh7Y"
@@ -119,7 +120,10 @@ async def get_user_from_token(token: str) -> Optional[dict]:
         async with httpx.AsyncClient() as client:
             r = await client.get(
                 f"{SUPABASE_URL}/auth/v1/user",
-                headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_SERVICE},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": SUPABASE_ANON or SUPABASE_SERVICE,
+                },
                 timeout=10,
             )
             if r.status_code == 200:
