@@ -442,25 +442,25 @@ async def check_shodan(domain: str, client: httpx.AsyncClient) -> dict:
 
 
 async def check_germany_bundesanzeiger(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search German Handelsregister — official German company register."""
+    """Search German company register via Bundesanzeiger."""
     try:
         brand = domain.rsplit(".", 1)[0].replace("-", " ")
-        r = await client.get(
-            "https://www.handelsregister.de/rp_web/mask.do",
-            params={"Typ": "n", "comp.name": brand},
-            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "de,en;q=0.9"},
+        r = await client.post(
+            "https://www.bundesanzeiger.de/pub/de/search?0",
+            data={"fulltext": brand, "category": "R"},
+            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "de,en;q=0.9", "Content-Type": "application/x-www-form-urlencoded"},
             timeout=15, follow_redirects=True,
         )
         found = r.status_code == 200 and brand.lower() in r.text.lower()
-        companies = re.findall(r'<td[^>]*class="[^"]*comp[^"]*"[^>]*>([^<]+)<', r.text)[:5] if found else []
+        companies = re.findall(r'class="result_column_name[^"]*">([^<]+)<', r.text)[:5] if found else []
         return {
             "found": found,
             "companies": [c.strip() for c in companies],
-            "search_url": f"https://www.handelsregister.de/rp_web/mask.do?comp.name={brand}",
-            "note": "German Handelsregister — official company register"
+            "search_url": f"https://www.bundesanzeiger.de/pub/de/search?fulltext={brand}",
+            "note": "German Bundesanzeiger — federal company gazette"
         }
     except Exception as e:
-        return {"error": str(e)}
+        return {"found": False, "note": f"German register check failed: {str(e)}"}
 
 
 async def check_australia_asic(domain: str, client: httpx.AsyncClient) -> dict:
@@ -507,32 +507,33 @@ async def check_canada_corporations(domain: str, client: httpx.AsyncClient) -> d
 
 
 async def check_india_mca(domain: str, client: httpx.AsyncClient) -> dict:
-    """Search India MCA — company search via public portal."""
+    """Search India MCA — company search via public API."""
     try:
         brand = domain.rsplit(".", 1)[0].replace("-", " ")
+        # MCA v3 public search
         r = await client.get(
-            "https://www.mca.gov.in/mcafoportal/getCompanyDetails.do",
-            params={"companyName": brand, "companyCategory": ""},
+            "https://efiling.mca.gov.in/SearchService/rest/getSearchResult/COMPANY",
+            params={"companyName": brand, "limit": 5},
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "application/json, text/javascript, */*",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": "https://www.mca.gov.in/",
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+                "Referer": "https://efiling.mca.gov.in/",
             },
-            timeout=15, follow_redirects=True,
+            timeout=15,
         )
         found = False
         companies = []
         if r.status_code == 200:
             try:
                 data = r.json()
-                companies = [c.get("companyName", "") for c in data.get("companyList", [])[:5]]
+                items = data if isinstance(data, list) else data.get("data", data.get("companyList", []))
+                companies = [c.get("companyName", c.get("COMPANY_NAME", "")) for c in items[:5] if isinstance(c, dict)]
                 found = len(companies) > 0
             except Exception:
-                found = brand.lower() in r.text.lower()
+                pass
         return {"found": found, "companies": companies, "note": "India MCA21 — Ministry of Corporate Affairs"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"found": False, "note": f"India MCA check failed: {str(e)}"}
 
 
 async def check_singapore_acra(domain: str, client: httpx.AsyncClient) -> dict:
