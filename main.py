@@ -117,19 +117,20 @@ def clean_domain(target: str) -> str:
 async def get_user_from_token(token: str) -> Optional[dict]:
     """Decode Supabase JWT to get user info — no external call needed."""
     try:
-        import base64, json as _json
-        # JWT is three base64 parts separated by dots
+        import base64, json as _json, time
         parts = token.split(".")
         if len(parts) != 3:
+            logger.warning(f"Token has {len(parts)} parts, expected 3")
             return None
-        # Decode payload (add padding if needed)
         payload = parts[1]
         payload += "=" * (4 - len(payload) % 4)
         decoded = base64.urlsafe_b64decode(payload)
         data = _json.loads(decoded)
-        # Check expiry
-        import time
-        if data.get("exp", 0) < time.time():
+        exp = data.get("exp", 0)
+        now = time.time()
+        logger.info(f"Token sub={data.get('sub')} email={data.get('email')} exp={exp} now={int(now)} expired={exp < now}")
+        if exp < now:
+            logger.warning("Token is expired")
             return None
         return {"id": data.get("sub"), "email": data.get("email")}
     except Exception as e:
