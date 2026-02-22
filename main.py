@@ -115,21 +115,25 @@ def clean_domain(target: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def get_user_from_token(token: str) -> Optional[dict]:
-    """Verify Supabase JWT and return user info."""
+    """Decode Supabase JWT to get user info — no external call needed."""
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{SUPABASE_URL}/auth/v1/user",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "apikey": SUPABASE_ANON or SUPABASE_SERVICE,
-                },
-                timeout=10,
-            )
-            if r.status_code == 200:
-                return r.json()
+        import base64, json as _json
+        # JWT is three base64 parts separated by dots
+        parts = token.split(".")
+        if len(parts) != 3:
             return None
-    except Exception:
+        # Decode payload (add padding if needed)
+        payload = parts[1]
+        payload += "=" * (4 - len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload)
+        data = _json.loads(decoded)
+        # Check expiry
+        import time
+        if data.get("exp", 0) < time.time():
+            return None
+        return {"id": data.get("sub"), "email": data.get("email")}
+    except Exception as e:
+        logger.warning(f"Token decode failed: {e}")
         return None
 
 
