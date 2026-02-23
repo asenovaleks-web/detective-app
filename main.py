@@ -661,7 +661,7 @@ async def check_singapore_acra(domain: str, client: httpx.AsyncClient) -> dict:
 # CLAUDE SYNTHESIS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def synthesize_with_claude(target: str, all_data: dict) -> dict:
+async def synthesize_with_claude(target: str, all_data: dict, base_score: int = 50, data_confidence: str = 'medium') -> dict:
     if not ANTHROPIC_KEY:
         raise HTTPException(status_code=500, detail="No Anthropic API key configured")
 
@@ -974,7 +974,7 @@ async def investigate(req: InvestigateRequest):
         all_intelligence["data_confidence"] = data_confidence
 
         logger.info("Calling Claude for analysis...")
-        analysis = await synthesize_with_claude(req.target, all_intelligence)
+        analysis = await synthesize_with_claude(req.target, all_intelligence, base_score, data_confidence)
         logger.info(f"Claude verdict: {analysis.get('verdict')} score: {analysis.get('score')}")
 
         final_score = analysis.get("score", base_score)
