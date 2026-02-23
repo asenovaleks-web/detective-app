@@ -77,8 +77,8 @@ SUPABASE_SERVICE  = os.getenv("SUPABASE_SERVICE_KEY", "")
 SUPABASE_ANON     = os.getenv("SUPABASE_ANON_KEY", "")
 STRIPE_SECRET     = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK    = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_PRICE_ID   = "price_1T3cu8ACEfVvmWmy3Q6tZGFh"
-FRONTEND_URL      = "https://detective-frontend-umber.vercel.app"
+STRIPE_PRICE_ID   = os.environ.get("STRIPE_PRICE_ID", "price_1T3cu8ACEfVvmWmy3Q6tZGFh")
+FRONTEND_URL      = os.environ.get("FRONTEND_URL", "https://signumaiapp.com")
 
 FREE_DAILY_LIMIT  = 3
 
@@ -102,6 +102,9 @@ class InvestigateResponse(BaseModel):
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────
+    data_confidence: str = "medium"
+    scan_count: int = 0
+
 def clean_domain(target: str) -> str:
     target = target.strip().lower()
     for prefix in ("https://", "http://", "www."):
@@ -702,7 +705,13 @@ Respond ONLY with a valid JSON object (no markdown, no preamble):
 }}
 
 Be honest and direct. If something looks like a scam, say so clearly. If safe, say that too.
-Only mention regional registries in findings if they return something meaningful — not every site will appear in every country's register."""
+Only mention regional registries in findings if they return something meaningful — not every site will appear in every country's register.
+IMPORTANT DISTINCTIONS:
+- "Unknown domain age" means insufficient data — NOT a risk signal on its own.
+- A domain not found in VirusTotal (404) means it has no history there — treat as NEUTRAL, not suspicious.
+- New domains (< 6 months) are worth noting as CAUTION but not automatically dangerous.
+- Base score provided: {base_score}/100. Use this as your anchor and adjust based on qualitative signals.
+- Data confidence level: {data_confidence}. Reflect this in your verdict_summary if confidence is low."""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -721,6 +730,139 @@ Only mention regional registries in findings if they return something meaningful
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN ENDPOINT
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ── Trusted infrastructure domains ───────────────────────────────────────────
+TRUSTED_INFRA = [
+    "vercel.app", "netlify.app", "github.io", "githubusercontent.com",
+    "railway.app", "render.com", "fly.dev", "cloudflare.com",
+    "amazonaws.com", "azurewebsites.net", "googleusercontent.com",
+    "heroku.com", "surge.sh", "pages.dev"
+]
+
+def is_trusted_infra(domain: str) -> str | None:
+    for infra in TRUSTED_INFRA:
+        if domain.endswith(infra):
+            return infra
+    return None
+
+def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_data: dict) -> tuple[int, str]:
+    """Deterministic scoring formula. Returns (score, confidence)."""
+    score = 30  # neutral baseline
+    data_points = 0
+
+    # VirusTotal
+    if isinstance(vt_data, dict) and vt_data.get("engines_total", 0) > 0:
+        data_points += 3
+        malicious = vt_data.get("malicious", 0)
+        if malicious >= 5:
+            score += 45
+        elif malicious >= 2:
+            score += 30
+        elif malicious >= 1:
+            score += 20
+        elif vt_data.get("harmless", 0) > 30:
+            score -= 15  # well known safe site
+    # VT 404 = no data, not suspicious
+    # elif vt_data.get("not_found"): pass  — neutral
+
+    # Google Safe Browsing
+    if isinstance(gsb_data, dict):
+        data_points += 1
+        if gsb_data.get("flagged"):
+            score += 40
+
+    # Domain age
+    if isinstance(whois_data, dict):
+        age = whois_data.get("age_days")
+        if age is not None:
+            data_points += 2
+            if age < 30:
+                score += 25
+            elif age < 180:
+                score += 12
+            elif age > 730:
+                score -= 10  # established domain
+        if whois_data.get("privacy_protected"):
+            score += 5
+
+    # SSL
+    if isinstance(ssl_data, dict):
+        data_points += 1
+        if ssl_data.get("valid") is False:
+            score += 20
+        elif ssl_data.get("valid") is True:
+            score -= 5
+
+    score = max(0, min(100, score))
+
+    # Confidence based on data availability
+    if data_points >= 5:
+        confidence = "high"
+    elif data_points >= 2:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return score, confidence
+
+
+async def get_cached_scan(domain: str) -> dict | None:
+    """Return cached scan result if scanned in last 24 hours."""
+    if not SUPABASE_URL:
+        return None
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/domain_scans?domain=eq.{domain}&last_scanned=gte.{cutoff}&select=scan_count,last_score,last_verdict&order=last_scanned.desc&limit=1",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                timeout=5,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data:
+                    return data[0]
+    except Exception:
+        pass
+    return None
+
+
+async def upsert_domain_scan(domain: str, score: int, verdict: str):
+    """Upsert domain scan stats — count + last result."""
+    if not SUPABASE_URL:
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            # Check if exists
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/domain_scans?domain=eq.{domain}&select=scan_count",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                timeout=5,
+            )
+            existing = r.json() if r.status_code == 200 else []
+            count = (existing[0]["scan_count"] + 1) if existing else 1
+
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/domain_scans",
+                headers={
+                    "apikey": SUPABASE_SERVICE,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                },
+                json={
+                    "domain": domain,
+                    "scan_count": count,
+                    "last_score": score,
+                    "last_verdict": verdict,
+                    "last_scanned": datetime.now(timezone.utc).isoformat(),
+                },
+                timeout=5,
+            )
+    except Exception as e:
+        logger.warning(f"Failed to upsert domain scan: {e}")
+
 
 @app.post("/investigate", response_model=InvestigateResponse)
 async def investigate(req: InvestigateRequest):
@@ -749,7 +891,26 @@ async def investigate(req: InvestigateRequest):
             # Anonymous user — allow but don't log
             pass
 
-        async with httpx.AsyncClient() as client:
+        # ── Trusted infrastructure fast-path ─────────────────────────────────
+        infra = is_trusted_infra(domain)
+        if infra:
+            logger.info(f"Trusted infrastructure detected: {infra}")
+            trusted_result = {
+                "score": 5,
+                "verdict": "GREEN",
+                "verdict_summary": "Trusted hosting infrastructure — no risk detected.",
+                "findings": [
+                    {"icon": "✅", "tag": "OK", "text": f"This domain is part of {infra} — a trusted global hosting platform."},
+                    {"icon": "🔒", "tag": "OK", "text": "Hosting infrastructure domains are not user-controlled websites."},
+                ],
+                "narrative": f"This is a {infra} infrastructure domain used for hosting websites and applications. It is not a user-controlled website and poses no risk. If you meant to check a specific site hosted on this platform, enter the full custom domain instead.",
+                "raw_labels": {"Infrastructure": infra, "Risk": "None", "Type": "Hosting platform"},
+                "data_confidence": "high",
+                "scan_count": 0,
+            }
+            return InvestigateResponse(**trusted_result, target=req.target, raw_data={})
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
             tasks = [
                 check_whoisxml(domain, client),              # 0
                 check_virustotal(domain, client),             # 1
@@ -805,23 +966,52 @@ async def investigate(req: InvestigateRequest):
             "singapore_acra": singapore_data,
         }
 
+        # ── Calculate base score deterministically ───────────────────────
+        base_score, data_confidence = calculate_base_score(
+            vt_data, gsb_data, whois_data, ssl_data
+        )
+        all_intelligence["base_score"] = base_score
+        all_intelligence["data_confidence"] = data_confidence
+
         logger.info("Calling Claude for analysis...")
         analysis = await synthesize_with_claude(req.target, all_intelligence)
         logger.info(f"Claude verdict: {analysis.get('verdict')} score: {analysis.get('score')}")
 
+        final_score = analysis.get("score", base_score)
+        final_verdict = analysis.get("verdict", "YELLOW")
+
         # ── Log investigation to database ─────────────────────────────────
         if user_id:
-            await log_investigation(user_id, domain, analysis.get("verdict", ""), analysis.get("score", 0))
+            await log_investigation(user_id, domain, final_verdict, final_score)
+
+        # ── Upsert domain scan stats ──────────────────────────────────────
+        await upsert_domain_scan(domain, final_score, final_verdict)
+
+        # ── Get scan count for social proof ──────────────────────────────
+        scan_count = 0
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/domain_scans?domain=eq.{domain}&select=scan_count",
+                    headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                    timeout=5,
+                )
+                if r.status_code == 200 and r.json():
+                    scan_count = r.json()[0].get("scan_count", 1)
+        except Exception:
+            pass
 
         return InvestigateResponse(
             target=req.target,
-            score=analysis.get("score", 50),
-            verdict=analysis.get("verdict", "YELLOW"),
+            score=final_score,
+            verdict=final_verdict,
             verdict_summary=analysis.get("verdict_summary", ""),
             findings=analysis.get("findings", []),
             narrative=analysis.get("narrative", ""),
             raw_labels=analysis.get("raw_labels", {}),
             raw_data=all_intelligence,
+            data_confidence=data_confidence,
+            scan_count=scan_count,
         )
 
     except Exception as e:
