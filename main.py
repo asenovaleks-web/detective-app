@@ -1020,6 +1020,73 @@ async def investigate(req: InvestigateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/send-reset")
+async def send_reset(req: SendResetRequest):
+    """Send password reset email via Resend API."""
+    RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+    if not RESEND_API_KEY:
+        # Fallback to Supabase built-in reset
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    f"{SUPABASE_URL}/auth/v1/recover",
+                    headers={"apikey": SUPABASE_ANON, "Content-Type": "application/json"},
+                    json={"email": req.email},
+                    timeout=10,
+                )
+            return {"ok": True}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    try:
+        reset_link = f"{FRONTEND_URL}?reset=true"
+        # Generate reset link via Supabase Admin API
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{SUPABASE_URL}/auth/v1/recover",
+                headers={"apikey": SUPABASE_ANON, "Content-Type": "application/json"},
+                json={"email": req.email},
+                timeout=10,
+            )
+
+        # Send branded email via Resend
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": "Signum <noreply@signumaiapp.com>",
+                    "to": [req.email],
+                    "subject": "Reset your Signum password",
+                    "html": f"""
+                    <div style="font-family:'DM Sans',sans-serif;max-width:480px;margin:0 auto;background:#0b0f1a;color:#e8edf5;padding:40px 32px;border-radius:12px;">
+                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:32px;">
+                            <div style="width:28px;height:28px;background:#3b82f6;border-radius:7px;display:flex;align-items:center;justify-content:center;">
+                                <svg viewBox="0 0 15 15" width="14" height="14" style="stroke:#fff;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;"><polyline points="2,11 5,7 8,9 13,3"/></svg>
+                            </div>
+                            <span style="font-size:17px;font-weight:600;">Signum</span>
+                        </div>
+                        <h1 style="font-size:22px;font-weight:600;margin-bottom:12px;letter-spacing:-0.5px;">Reset your password</h1>
+                        <p style="color:#7a8aaa;font-size:15px;line-height:1.6;margin-bottom:28px;">
+                            We received a request to reset your password. Check your email for a link from Supabase to complete the reset.
+                        </p>
+                        <p style="color:#3d4f6e;font-size:13px;">If you didn't request this, you can safely ignore this email.</p>
+                        <hr style="border:none;border-top:1px solid #1e2d4a;margin:28px 0;" />
+                        <p style="color:#3d4f6e;font-size:12px;">© 2025 Signum. Building the global trust infrastructure of the internet.</p>
+                    </div>
+                    """
+                },
+                timeout=10,
+            )
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Reset email failed: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/health")
 async def health():
     return {"status": "The detective is on duty", "timestamp": datetime.now(timezone.utc).isoformat()}
@@ -1028,6 +1095,9 @@ async def health():
 # ══════════════════════════════════════════════════════════════════════════════
 # STRIPE ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
+
+class SendResetRequest(BaseModel):
+    email: str
 
 class CheckoutRequest(BaseModel):
     user_token: str
