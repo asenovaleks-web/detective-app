@@ -84,6 +84,9 @@ FREE_DAILY_LIMIT  = 3
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
+class SendResetRequest(BaseModel):
+    email: str
+
 class InvestigateRequest(BaseModel):
     target: str
     include_reddit: bool = True
@@ -1095,9 +1098,6 @@ async def health():
 # ══════════════════════════════════════════════════════════════════════════════
 # STRIPE ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
-
-class SendResetRequest(BaseModel):
-    email: str
 
 class CheckoutRequest(BaseModel):
     user_token: str
