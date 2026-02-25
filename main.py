@@ -157,8 +157,11 @@ async def get_user_plan(user_id: str) -> str:
                 data = r.json()
                 if data:
                     profile = data[0]
-                    if profile.get("subscription_status") == "active":
-                        return profile.get("plan", "free")
+                    p = profile.get("plan", "free")
+                    s = profile.get("subscription_status", "")
+                    # Accept pro if plan=pro OR subscription_status=active
+                    if p == "pro" or s == "active":
+                        return "pro"
             return "free"
     except Exception:
         return "free"
@@ -809,6 +812,31 @@ def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_da
     return score, confidence
 
 
+async def update_watchlist_scores(domain: str, score: int, verdict: str):
+    """Update last_score and last_verdict for all users watching this domain."""
+    if not SUPABASE_URL:
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/watchlist?domain=eq.{domain}",
+                headers={
+                    "apikey": SUPABASE_SERVICE,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                json={
+                    "last_score": score,
+                    "last_verdict": verdict,
+                    "last_checked": datetime.now(timezone.utc).isoformat(),
+                },
+                timeout=5,
+            )
+    except Exception as e:
+        logger.warning(f"Failed to update watchlist scores: {e}")
+
+
 async def get_cached_scan(domain: str) -> dict | None:
     """Return cached scan result if scanned in last 24 hours."""
     if not SUPABASE_URL:
@@ -989,6 +1017,9 @@ async def investigate(req: InvestigateRequest):
 
         # ── Upsert domain scan stats ──────────────────────────────────────
         await upsert_domain_scan(domain, final_score, final_verdict)
+
+        # ── Update watchlist scores for all users monitoring this domain ──
+        await update_watchlist_scores(domain, final_score, final_verdict)
 
         # ── Get scan count for social proof ──────────────────────────────
         scan_count = 0
