@@ -15,16 +15,7 @@ Data Sources (12 total — upgraded for accuracy):
   11. OTX AlienVault — 19M+ threat indicators from 100K+ researchers
   12. DNS Intelligence — IP resolution history & changes
 
-Environment variables required:
-  ANTHROPIC_API_KEY
-  VIRUSTOTAL_API_KEY
-  WHOISXML_API_KEY
-  GOOGLE_SAFE_BROWSING_KEY
-  SUPABASE_URL
-  SUPABASE_SERVICE_KEY
-  IPQS_TOKEN
-  ABUSEIPDB_TOKEN
-  OTX_TOKEN
+Environment variables required: see Railway dashboard
 """
 
 import asyncio
@@ -77,9 +68,9 @@ STRIPE_SECRET     = _env.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK    = _env.get("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_ID   = _env.get("STRIPE_PRICE_ID", "price_1T3cu8ACEfVvmWmy3Q6tZGFh")
 FRONTEND_URL      = _env.get("FRONTEND_URL", "https://signumaiapp.com")
-IPQS_KEY          = _env.get("IPQS_TOKEN", "")
-ABUSEIPDB_KEY     = _env.get("ABUSEIPDB_TOKEN", "")
-OTX_KEY           = _env.get("OTX_TOKEN", "")
+IPQS_KEY          = _env.get("IPQS_KEY", "")
+ABUSEIPDB_KEY     = _env.get("ABUSEIPDB_KEY", "")
+OTX_KEY           = _env.get("OTX_KEY", "")
 
 FREE_DAILY_LIMIT  = 3
 
