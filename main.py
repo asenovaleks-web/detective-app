@@ -22,9 +22,9 @@ Environment variables required:
   GOOGLE_SAFE_BROWSING_KEY
   SUPABASE_URL
   SUPABASE_SERVICE_KEY
-  IPQS_API_KEY
-  ABUSEIPDB_API_KEY
-  OTX_API_KEY
+  IPQS_TOKEN
+  ABUSEIPDB_TOKEN
+  OTX_TOKEN
 """
 
 import asyncio
@@ -63,20 +63,23 @@ async def options_investigate():
     return {"status": "ok"}
 
 # ── Config ────────────────────────────────────────────────────────────────────
-VIRUSTOTAL_KEY    = os.getenv("VIRUSTOTAL_API_KEY", "")
-WHOISXML_KEY      = os.getenv("WHOISXML_API_KEY", "")
-GOOGLE_SB_KEY     = os.getenv("GOOGLE_SAFE_BROWSING_KEY", "")
-ANTHROPIC_KEY     = os.getenv("ANTHROPIC_API_KEY", "")
-SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE  = os.getenv("SUPABASE_SERVICE_KEY", "")
-SUPABASE_ANON     = os.getenv("SUPABASE_ANON_KEY", "")
-STRIPE_SECRET     = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK    = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_PRICE_ID   = os.environ.get("STRIPE_PRICE_ID", "price_1T3cu8ACEfVvmWmy3Q6tZGFh")
-FRONTEND_URL      = os.environ.get("FRONTEND_URL", "https://signumaiapp.com")
-IPQS_KEY          = os.environ.get("IPQS_TOKEN", "")
-ABUSEIPDB_KEY     = os.environ.get("ABUSEIPDB_TOKEN", "")
-OTX_KEY           = os.environ.get("OTX_TOKEN", "")
+# Load all config from environment
+_env = os.environ
+
+VIRUSTOTAL_KEY    = _env.get("VIRUSTOTAL_API_KEY", "")
+WHOISXML_KEY      = _env.get("WHOISXML_API_KEY", "")
+GOOGLE_SB_KEY     = _env.get("GOOGLE_SAFE_BROWSING_KEY", "")
+ANTHROPIC_KEY     = _env.get("ANTHROPIC_API_KEY", "")
+SUPABASE_URL      = _env.get("SUPABASE_URL", "")
+SUPABASE_SERVICE  = _env.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_ANON     = _env.get("SUPABASE_ANON_KEY", "")
+STRIPE_SECRET     = _env.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK    = _env.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID   = _env.get("STRIPE_PRICE_ID", "price_1T3cu8ACEfVvmWmy3Q6tZGFh")
+FRONTEND_URL      = _env.get("FRONTEND_URL", "https://signumaiapp.com")
+IPQS_KEY          = _env.get("IPQS_TOKEN", "")
+ABUSEIPDB_KEY     = _env.get("ABUSEIPDB_TOKEN", "")
+OTX_KEY           = _env.get("OTX_TOKEN", "")
 
 FREE_DAILY_LIMIT  = 3
 
@@ -665,7 +668,7 @@ async def check_singapore_acra(domain: str, client: httpx.AsyncClient) -> dict:
 async def check_ipqs(domain: str, client: httpx.AsyncClient) -> dict:
     """IPQualityScore — phishing, malware, parked domain, spam, risk score."""
     if not IPQS_KEY:
-        return {"error": "No IPQS API key configured"}
+        return {"error": "No IPQS token configured"}
     try:
         r = await client.get(
             f"https://www.ipqualityscore.com/api/json/url/{IPQS_KEY}/{domain}",
@@ -724,7 +727,7 @@ async def check_abuseipdb(domain: str, client: httpx.AsyncClient) -> dict:
 async def check_otx(domain: str, client: httpx.AsyncClient) -> dict:
     """AlienVault OTX — open threat exchange indicators."""
     if not OTX_KEY:
-        return {"error": "No OTX API key configured"}
+        return {"error": "No OTX token configured"}
     try:
         headers = {"X-OTX-API-KEY": OTX_KEY}
         # General indicators
@@ -1209,7 +1212,7 @@ async def investigate(req: InvestigateRequest):
 @app.post("/send-reset")
 async def send_reset(req: SendResetRequest):
     """Send password reset email via Resend API."""
-    RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+    RESEND_API_KEY = _env.get("RESEND_API_KEY", "")
     if not RESEND_API_KEY:
         # Fallback to Supabase built-in reset
         try:
