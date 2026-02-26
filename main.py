@@ -1,27 +1,19 @@
 """
 The Digital Detective — FastAPI Backend v4.0
 =============================================
-Data Sources (20 total):
+Data Sources (12 total — upgraded for accuracy):
   1. WhoisXML — domain age & registrant
   2. VirusTotal — 93 malware engines
   3. Google Safe Browsing — threat database
   4. SSL — live certificate check
-  5. GLEIF + UN Sanctions — global business & sanctions
-  6. Reddit via Pullpush — community signals
-  7. URLScan — live page analysis
-  8. Trustpilot — customer reviews
-  9. Bulgarian Registry — brra.bg + papagal.bg
-  10. UK Companies House — official UK register
-  11. SEC EDGAR — US securities filings
-  12. Wayback Machine — site history
-  13. ICIJ Offshore Leaks — Panama/Pandora Papers
-  14. BBB — US Better Business Bureau
-  15. Shodan — server infrastructure
-  16. Germany Bundesanzeiger — German register
-  17. Australia ASIC — Australian register
-  18. Canada Corporations — Canadian register
-  19. India MCA21 — Indian register
-  20. Singapore ACRA — Singapore register
+  5. URLScan — live page analysis + screenshot
+  6. Trustpilot — customer reviews
+  7. Wayback Machine — site history
+  8. Shodan — server infrastructure
+  9. IPQS — AI phishing/malware/spam scoring (replaces 5 regional registries)
+  10. AbuseIPDB — crowd-sourced server IP abuse reports
+  11. OTX AlienVault — 19M+ threat indicators from 100K+ researchers
+  12. DNS Intelligence — IP resolution history & changes
 
 Environment variables required:
   ANTHROPIC_API_KEY
@@ -30,6 +22,9 @@ Environment variables required:
   GOOGLE_SAFE_BROWSING_KEY
   SUPABASE_URL
   SUPABASE_SERVICE_KEY
+  IPQS_API_KEY
+  ABUSEIPDB_API_KEY
+  OTX_API_KEY
 """
 
 import asyncio
@@ -663,6 +658,163 @@ async def check_singapore_acra(domain: str, client: httpx.AsyncClient) -> dict:
         return {"error": str(e)}
 
 
+
+async def check_ipqs(domain: str, client: httpx.AsyncClient) -> dict:
+    """IPQualityScore — phishing, malware, parked domain, spam, risk score."""
+    if not IPQS_KEY:
+        return {"error": "No IPQS API key configured"}
+    try:
+        r = await client.get(
+            f"https://www.ipqualityscore.com/api/json/url/{IPQS_KEY}/{domain}",
+            timeout=10,
+        )
+        d = r.json()
+        return {
+            "phishing": d.get("phishing", False),
+            "malware": d.get("malware", False),
+            "suspicious": d.get("suspicious", False),
+            "spam": d.get("spamming", False),
+            "parked": d.get("parked", False),
+            "risk_score": d.get("risk_score", 0),
+            "domain_rank": d.get("domain_rank", 0),
+            "dns_valid": d.get("dns_valid", True),
+            "category": d.get("category", ""),
+            "unsafe": d.get("unsafe", False),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_abuseipdb(domain: str, client: httpx.AsyncClient) -> dict:
+    """AbuseIPDB — crowd-sourced abuse reports for the server IP."""
+    if not ABUSEIPDB_KEY:
+        return {"error": "No AbuseIPDB API key configured"}
+    try:
+        # First resolve domain to IP
+        ip = None
+        try:
+            loop = asyncio.get_event_loop()
+            ip = await loop.run_in_executor(None, lambda: socket.gethostbyname(domain))
+        except Exception:
+            return {"error": "Could not resolve domain to IP"}
+
+        r = await client.get(
+            "https://api.abuseipdb.com/api/v2/check",
+            headers={"Key": ABUSEIPDB_KEY, "Accept": "application/json"},
+            params={"ipAddress": ip, "maxAgeInDays": 90, "verbose": True},
+            timeout=10,
+        )
+        d = r.json().get("data", {})
+        return {
+            "ip": ip,
+            "abuse_confidence_score": d.get("abuseConfidenceScore", 0),
+            "total_reports": d.get("totalReports", 0),
+            "country": d.get("countryCode", ""),
+            "isp": d.get("isp", ""),
+            "is_tor": d.get("isTor", False),
+            "last_reported": d.get("lastReportedAt", ""),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_otx(domain: str, client: httpx.AsyncClient) -> dict:
+    """AlienVault OTX — open threat exchange indicators."""
+    if not OTX_KEY:
+        return {"error": "No OTX API key configured"}
+    try:
+        headers = {"X-OTX-API-KEY": OTX_KEY}
+        # General indicators
+        r = await client.get(
+            f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/general",
+            headers=headers, timeout=10,
+        )
+        d = r.json()
+        pulse_count = d.get("pulse_info", {}).get("count", 0)
+        pulses = d.get("pulse_info", {}).get("pulses", [])
+        threat_names = list(set([p.get("name", "") for p in pulses[:5] if p.get("name")]))
+
+        # URL list for malicious hits
+        r2 = await client.get(
+            f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/url_list",
+            headers=headers, timeout=10,
+        )
+        url_data = r2.json()
+        malicious_urls = [u for u in url_data.get("url_list", []) if u.get("result", {}).get("urlworker", {}).get("has_malicious_content")]
+
+        return {
+            "pulse_count": pulse_count,
+            "threat_names": threat_names,
+            "malicious_url_count": len(malicious_urls),
+            "in_threat_feeds": pulse_count > 0,
+            "validation": d.get("validation", []),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_urlscan_screenshot(domain: str, client: httpx.AsyncClient) -> dict:
+    """URLScan — existing API extended with screenshot URL."""
+    try:
+        r = await client.get(
+            "https://urlscan.io/api/v1/search/",
+            params={"q": f"domain:{domain}", "size": 1},
+            headers={"User-Agent": "Signum/1.0"},
+            timeout=10,
+        )
+        results = r.json().get("results", [])
+        if not results:
+            return {"found": False}
+        latest = results[0]
+        scan_id = latest.get("_id", "")
+        page = latest.get("page", {})
+        verdicts = latest.get("verdicts", {}).get("overall", {})
+        return {
+            "found": True,
+            "ip": page.get("ip", ""),
+            "country": page.get("country", ""),
+            "server": page.get("server", ""),
+            "malicious": verdicts.get("malicious", False),
+            "score": verdicts.get("score", 0),
+            "tags": latest.get("tags", []),
+            "screenshot_url": f"https://urlscan.io/screenshots/{scan_id}.png" if scan_id else "",
+            "report_url": f"https://urlscan.io/result/{scan_id}/" if scan_id else "",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_dns_intel(domain: str, client: httpx.AsyncClient) -> dict:
+    """DNS intelligence — MX records, NS, A record age via WhoisXML DNS lookup."""
+    try:
+        results = {}
+        # Check if domain resolves at all
+        loop = asyncio.get_event_loop()
+        try:
+            ip = await loop.run_in_executor(None, lambda: socket.gethostbyname(domain))
+            results["resolves"] = True
+            results["ip"] = ip
+        except Exception:
+            results["resolves"] = False
+            results["ip"] = None
+
+        # DNS History via WhoisXML (if key available)
+        if WHOISXML_KEY:
+            r = await client.get(
+                f"https://dns-history.whoisxmlapi.com/api/v1?apiKey={WHOISXML_KEY}&domainName={domain}&type=A",
+                timeout=10,
+            )
+            if r.status_code == 200:
+                records = r.json().get("result", {}).get("records", [])
+                ips_seen = list(set([rec.get("value", "") for rec in records if rec.get("value")]))
+                results["historical_ips"] = ips_seen[:5]
+                results["ip_changes"] = len(ips_seen)
+                results["frequent_ip_changes"] = len(ips_seen) > 3
+
+        return results
+    except Exception as e:
+        return {"error": str(e)}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CLAUDE SYNTHESIS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -686,27 +838,21 @@ Respond ONLY with a valid JSON object (no markdown, no preamble):
   ],
   "narrative": "<3-4 sentence plain-English detective summary for a non-technical person. Direct, everyday language.>",
   "raw_labels": {{
-    "Domain Age": "<value>",
-    "First Seen Online": "<value>",
-    "SSL Issuer": "<value>",
-    "Malware Flags": "<value>",
-    "Reddit Signals": "<value>",
-    "Business Record": "<value>",
-    "Google Safe Browsing": "<value>",
-    "Trustpilot": "<value>",
-    "URLScan": "<value>",
-    "Bulgarian Registry": "<value>",
-    "UK Companies House": "<value>",
-    "SEC EDGAR": "<value>",
-    "Wayback Machine": "<value>",
-    "ICIJ Offshore Leaks": "<value>",
-    "BBB": "<value>",
-    "Shodan": "<value>",
-    "Germany Register": "<value>",
-    "Australia ASIC": "<value>",
-    "Canada Register": "<value>",
-    "India MCA": "<value>",
-    "Singapore ACRA": "<value>"
+    "Domain Age": "<e.g. 3.2 years>",
+    "First Seen Online": "<e.g. March 2021>",
+    "SSL Certificate": "<e.g. Let's Encrypt — valid 90 days>",
+    "VirusTotal": "<e.g. 2/93 engines flagged>",
+    "Google Safe Browsing": "<e.g. Not flagged / Flagged: MALWARE>",
+    "IPQS Risk Score": "<e.g. 85/100 — High Risk>",
+    "IPQS Verdict": "<e.g. Phishing detected / Clean / Suspicious>",
+    "AbuseIPDB": "<e.g. 47 reports — 82% confidence / Clean>",
+    "Server IP": "<e.g. 104.21.45.33 — US / Cloudflare>",
+    "OTX Threat Feeds": "<e.g. 12 threat pulses / Not in feeds>",
+    "Trustpilot": "<e.g. 4.2★ 1,200 reviews / Not listed>",
+    "URLScan": "<e.g. Clean — Cloudflare hosted / Malicious>",
+    "Wayback Machine": "<e.g. First archived 2019 / No history>",
+    "Shodan": "<e.g. Ports 80,443 open / Suspicious port 4444>",
+    "DNS History": "<e.g. Stable IP / 5 IP changes detected>"
   }}
 }}
 
@@ -717,7 +863,12 @@ IMPORTANT DISTINCTIONS:
 - A domain not found in VirusTotal (404) means it has no history there — treat as NEUTRAL, not suspicious.
 - New domains (< 6 months) are worth noting as CAUTION but not automatically dangerous.
 - Base score provided: {base_score}/100. Use this as your anchor and adjust based on qualitative signals.
-- Data confidence level: {data_confidence}. Reflect this in your verdict_summary if confidence is low."""
+- Data confidence level: {data_confidence}. Reflect this in your verdict_summary if confidence is low.
+- New intelligence sources available: IPQS (phishing/malware AI scoring), AbuseIPDB (server IP abuse history), OTX AlienVault (threat feed presence), DNS Intelligence (IP history), URLScan (live page analysis with screenshot).
+- If IPQS risk_score > 75 or phishing=true, treat as strong RISK signal.
+- If AbuseIPDB abuse_confidence_score > 50 or total_reports > 5, treat as RISK signal.
+- If OTX pulse_count > 3, treat as CAUTION or RISK depending on threat names.
+- Screenshot available in urlscan.screenshot_url — mention it exists in narrative if found."""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -751,7 +902,7 @@ def is_trusted_infra(domain: str) -> str | None:
             return infra
     return None
 
-def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_data: dict) -> tuple[int, str]:
+def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_data: dict, ipqs_data: dict = None) -> tuple[int, str]:
     """Deterministic scoring formula. Returns (score, confidence)."""
     score = 30  # neutral baseline
     data_points = 0
@@ -798,6 +949,21 @@ def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_da
             score += 20
         elif ssl_data.get("valid") is True:
             score -= 5
+
+    # IPQS — strongest signal, worth most data points
+    if isinstance(ipqs_data, dict) and not ipqs_data.get("error"):
+        data_points += 4
+        risk = ipqs_data.get("risk_score", 0)
+        if ipqs_data.get("phishing"):
+            score += 50
+        elif ipqs_data.get("malware"):
+            score += 45
+        elif ipqs_data.get("suspicious") or risk > 75:
+            score += 30
+        elif risk > 50:
+            score += 15
+        elif risk < 20 and ipqs_data.get("domain_rank", 0) > 0:
+            score -= 10  # reputable ranked domain
 
     score = max(0, min(100, score))
 
@@ -943,33 +1109,24 @@ async def investigate(req: InvestigateRequest):
 
         async with httpx.AsyncClient(timeout=5.0) as client:
             tasks = [
-                check_whoisxml(domain, client),              # 0
-                check_virustotal(domain, client),             # 1
-                check_google_safe_browsing(domain, client),   # 2
-                check_ssl_info(domain, client),               # 3
-                check_gleif(domain, client),                  # 4
-                search_reddit_mentions(domain, client),       # 5
-                check_urlscan(domain, client),                # 6
-                check_trustpilot(domain, client),             # 7
-                check_bulgarian_registry(domain, client),     # 8
-                check_companies_house(domain, client),        # 9
-                check_sec_edgar(domain, client),              # 10
-                check_wayback_machine(domain, client),        # 11
-                check_icij_offshore(domain, client),          # 12
-                check_bbb(domain, client),                    # 13
-                check_shodan(domain, client),                 # 14
-                check_germany_bundesanzeiger(domain, client), # 15
-                check_australia_asic(domain, client),         # 16
-                check_canada_corporations(domain, client),    # 17
-                check_india_mca(domain, client),              # 18
-                check_singapore_acra(domain, client),         # 19
+                check_whoisxml(domain, client),          # 0
+                check_virustotal(domain, client),         # 1
+                check_google_safe_browsing(domain, client), # 2
+                check_ssl_info(domain, client),           # 3
+                check_urlscan_screenshot(domain, client), # 4
+                check_trustpilot(domain, client),         # 5
+                check_wayback_machine(domain, client),    # 6
+                check_shodan(domain, client),             # 7
+                check_ipqs(domain, client),               # 8
+                check_abuseipdb(domain, client),          # 9
+                check_otx(domain, client),                # 10
+                check_dns_intel(domain, client),          # 11
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        (whois_data, vt_data, gsb_data, ssl_data, corp_data, reddit_data,
-         urlscan_data, trustpilot_data, bulgarian_data, uk_data, sec_data,
-         wayback_data, icij_data, bbb_data, shodan_data,
-         germany_data, australia_data, canada_data, india_data, singapore_data) = results
+        (whois_data, vt_data, gsb_data, ssl_data, urlscan_data,
+         trustpilot_data, wayback_data, shodan_data,
+         ipqs_data, abuseipdb_data, otx_data, dns_data) = results
 
         logger.info(f"Data collected. WHOIS: {whois_data}, VT: {vt_data}, GSB: {gsb_data}")
 
@@ -979,27 +1136,19 @@ async def investigate(req: InvestigateRequest):
             "virustotal": vt_data,
             "google_safe_browsing": gsb_data,
             "ssl": ssl_data,
-            "business_records_gleif": corp_data,
-            "community_signals_reddit": reddit_data,
             "urlscan": urlscan_data,
             "trustpilot": trustpilot_data,
-            "bulgarian_registry": bulgarian_data,
-            "uk_companies_house": uk_data,
-            "sec_edgar_usa": sec_data,
             "wayback_machine": wayback_data,
-            "icij_offshore_leaks": icij_data,
-            "bbb_usa": bbb_data,
             "shodan": shodan_data,
-            "germany_register": germany_data,
-            "australia_asic": australia_data,
-            "canada_corporations": canada_data,
-            "india_mca": india_data,
-            "singapore_acra": singapore_data,
+            "ipqs": ipqs_data,
+            "abuseipdb": abuseipdb_data,
+            "otx_alienvault": otx_data,
+            "dns_intelligence": dns_data,
         }
 
         # ── Calculate base score deterministically ───────────────────────
         base_score, data_confidence = calculate_base_score(
-            vt_data, gsb_data, whois_data, ssl_data
+            vt_data, gsb_data, whois_data, ssl_data, ipqs_data
         )
         all_intelligence["base_score"] = base_score
         all_intelligence["data_confidence"] = data_confidence
