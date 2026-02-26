@@ -976,11 +976,20 @@ def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_da
 
 
 async def update_watchlist_scores(domain: str, score: int, verdict: str):
-    """Update last_score and last_verdict for all users watching this domain."""
+    """Update watchlist scores and send alert emails if verdict changed."""
     if not SUPABASE_URL:
         return
     try:
         async with httpx.AsyncClient() as client:
+            # Get current watchlist entries for this domain to detect changes
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/watchlist?domain=eq.{domain}&select=id,user_id,last_score,last_verdict",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                timeout=5,
+            )
+            entries = r.json() if r.status_code == 200 else []
+
+            # Update scores
             await client.patch(
                 f"{SUPABASE_URL}/rest/v1/watchlist?domain=eq.{domain}",
                 headers={
@@ -996,6 +1005,28 @@ async def update_watchlist_scores(domain: str, score: int, verdict: str):
                 },
                 timeout=5,
             )
+
+            # Send alert emails for significant changes
+            for entry in entries:
+                old_verdict = entry.get("last_verdict")
+                old_score = entry.get("last_score") or 0
+                if old_verdict and old_verdict != verdict:
+                    # Verdict changed — fetch user email and send alert
+                    user_id = entry.get("user_id")
+                    if user_id:
+                        ur = await client.get(
+                            f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                            headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                            timeout=5,
+                        )
+                        if ur.status_code == 200:
+                            user_email = ur.json().get("email", "")
+                            if user_email:
+                                asyncio.create_task(send_watchlist_alert_email(
+                                    user_email, domain, old_score, score, old_verdict, verdict
+                                ))
+                                logger.info(f"Watchlist alert sent: {domain} {old_verdict}→{verdict} to {user_email}")
+
     except Exception as e:
         logger.warning(f"Failed to update watchlist scores: {e}")
 
@@ -1161,6 +1192,18 @@ async def investigate(req: InvestigateRequest):
         if user_id:
             await log_investigation(user_id, domain, final_verdict, final_score)
 
+            # ── Email lifecycle triggers ──────────────────────────────────
+            if user and user_plan == "free":
+                daily = await get_daily_count(user_id)
+                user_email = user.get("email", "")
+                if user_email:
+                    if daily == 1:
+                        # First scan ever
+                        asyncio.create_task(send_first_scan_email(user_email, domain))
+                    elif daily == 3:
+                        # Third scan — upgrade nudge
+                        asyncio.create_task(send_upgrade_nudge_email(user_email))
+
         # ── Upsert domain scan stats ──────────────────────────────────────
         await upsert_domain_scan(domain, final_score, final_verdict)
 
@@ -1271,6 +1314,184 @@ async def send_reset(req: SendResetRequest):
 async def health():
     return {"status": "The detective is on duty", "timestamp": datetime.now(timezone.utc).isoformat()}
 
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EMAIL LIFECYCLE — Resend
+# ══════════════════════════════════════════════════════════════════════════════
+
+def signum_email_base(content_html: str) -> str:
+    return f"""
+    <div style="font-family:'DM Sans',Arial,sans-serif;max-width:520px;margin:0 auto;background:#0b0f1a;color:#e8edf5;padding:40px 32px;border-radius:12px;">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:36px;">
+        <div style="width:28px;height:28px;background:#3b82f6;border-radius:7px;display:flex;align-items:center;justify-content:center;">
+          <svg viewBox="0 0 15 15" width="14" height="14" style="stroke:#fff;fill:none;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round;"><polyline points="2,11 5,7 8,9 13,3"/></svg>
+        </div>
+        <span style="font-size:17px;font-weight:600;letter-spacing:-0.3px;">Signum</span>
+      </div>
+      {content_html}
+      <hr style="border:none;border-top:1px solid #1e2d4a;margin:32px 0 20px;" />
+      <p style="color:#3d4f6e;font-size:12px;margin:0;">© 2025 Signum · Building the global trust infrastructure of the internet.</p>
+    </div>
+    """
+
+async def send_email(to: str, subject: str, html: str):
+    RESEND_KEY = _env.get("RESEND_API_KEY", "")
+    if not RESEND_KEY:
+        logger.warning("No Resend key — email not sent")
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
+                json={"from": "Signum <noreply@signumaiapp.com>", "to": [to], "subject": subject, "html": html},
+                timeout=10,
+            )
+            if r.status_code not in (200, 201):
+                logger.warning(f"Resend error: {r.status_code} {r.text}")
+    except Exception as e:
+        logger.warning(f"Email send failed: {e}")
+
+async def send_welcome_email(to: str):
+    html = signum_email_base("""
+      <h1 style="font-size:22px;font-weight:700;margin:0 0 12px;letter-spacing:-0.5px;">You're in.</h1>
+      <p style="font-size:15px;line-height:1.7;color:#7a8aaa;margin:0 0 28px;">
+        Real-time risk analysis on any website — instant and uncompromising.<br/>Paste any domain. Get the full picture in seconds.
+      </p>
+      <a href="https://signumaiapp.com" style="display:inline-block;background:#3b82f6;color:#fff;font-weight:600;font-size:14px;padding:12px 24px;border-radius:8px;text-decoration:none;letter-spacing:-0.2px;">Start your first scan →</a>
+    """)
+    await send_email(to, "You're in. Here's what Signum does.", html)
+
+async def send_first_scan_email(to: str, domain: str):
+    html = signum_email_base(f"""
+      <h1 style="font-size:22px;font-weight:700;margin:0 0 12px;letter-spacing:-0.5px;">You just ran your first scan.<br/>Here's what you didn't see.</h1>
+      <p style="font-size:15px;line-height:1.7;color:#7a8aaa;margin:0 0 8px;">You scanned <strong style="color:#e8edf5;">{domain}</strong>. Good instinct.</p>
+      <p style="font-size:15px;line-height:1.7;color:#7a8aaa;margin:0 0 8px;">But the free report only shows you part of the story. The rest — findings, AI analysis, full intelligence — is locked.</p>
+      <p style="font-size:15px;line-height:1.7;color:#7a8aaa;margin:0 0 28px;">Most people upgrade after their second scan. Some wait until it's too late.</p>
+      <a href="https://signumaiapp.com" style="display:inline-block;background:#3b82f6;color:#fff;font-weight:600;font-size:14px;padding:12px 24px;border-radius:8px;text-decoration:none;letter-spacing:-0.2px;">See the full report →</a>
+    """)
+    await send_email(to, "You just ran your first scan. Here's what you didn't see.", html)
+
+async def send_upgrade_nudge_email(to: str):
+    html = signum_email_base("""
+      <h1 style="font-size:22px;font-weight:700;margin:0 0 12px;letter-spacing:-0.5px;">You've scanned 3 domains.<br/>You're only seeing half the picture.</h1>
+      <p style="font-size:15px;line-height:1.7;color:#7a8aaa;margin:0 0 8px;">You've used Signum 3 times now. That tells us you take online safety seriously.</p>
+      <p style="font-size:15px;line-height:1.7;color:#7a8aaa;margin:0 0 8px;">The threats that matter most don't show up in the score. They show up in the details — the ones Pro users see every time.</p>
+      <p style="font-size:15px;line-height:1.7;color:#7a8aaa;margin:0 0 28px;">€3.99/month. The cost of one bad click is considerably higher.</p>
+      <a href="https://signumaiapp.com" style="display:inline-block;background:#6366f1;color:#fff;font-weight:600;font-size:14px;padding:12px 24px;border-radius:8px;text-decoration:none;letter-spacing:-0.2px;">Go Pro →</a>
+    """)
+    await send_email(to, "You've scanned 3 domains. You're only seeing half the picture.", html)
+
+async def send_watchlist_alert_email(to: str, domain: str, old_score: int, new_score: int, old_verdict: str, new_verdict: str):
+    verdict_colors = {"GREEN": "#22c55e", "YELLOW": "#eab308", "RED": "#ef4444"}
+    old_c = verdict_colors.get(old_verdict, "#7a8aaa")
+    new_c = verdict_colors.get(new_verdict, "#7a8aaa")
+    scan_url = f"https://signumaiapp.com/?domain={domain}"
+    html = signum_email_base(f"""
+      <h1 style="font-size:22px;font-weight:700;margin:0 0 12px;letter-spacing:-0.5px;">⚠️ One of your targets just changed.</h1>
+      <div style="background:#131929;border:1px solid #1e2d4a;border-radius:10px;padding:20px 24px;margin-bottom:24px;">
+        <div style="font-family:'DM Mono',monospace;font-size:15px;font-weight:600;color:#e8edf5;margin-bottom:14px;">{domain}</div>
+        <div style="display:flex;align-items:center;gap:12px;font-family:'DM Mono',monospace;font-size:13px;">
+          <span style="color:{old_c};font-weight:700;">{old_score} {old_verdict}</span>
+          <span style="color:#3d4f6e;">→</span>
+          <span style="color:{new_c};font-weight:700;">{new_score} {new_verdict}</span>
+        </div>
+      </div>
+      <p style="font-size:15px;line-height:1.7;color:#7a8aaa;margin:0 0 28px;">Score changes mean something changed on their end. It could be nothing. It probably isn't.<br/><strong style="color:#e8edf5;">Don't find out the hard way.</strong></p>
+      <a href="{scan_url}" style="display:inline-block;background:#3b82f6;color:#fff;font-weight:600;font-size:14px;padding:12px 24px;border-radius:8px;text-decoration:none;letter-spacing:-0.2px;">See what's happening →</a>
+    """)
+    await send_email(to, f"⚠️ One of your targets just changed — {domain}", html)
+
+
+# ── Email trigger endpoints ───────────────────────────────────────────────────
+
+class EmailWebhookRequest(BaseModel):
+    type: str
+    record: dict
+
+
+
+class TeamContactRequest(BaseModel):
+    name: str
+    email: str
+    company: str
+    team_size: str = ""
+
+@app.post("/team-contact")
+async def team_contact(req: TeamContactRequest):
+    """Handle Team plan contact requests — notify via email."""
+    try:
+        RESEND_KEY = _env.get("RESEND_API_KEY", "")
+        if RESEND_KEY:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    "https://api.resend.com/emails",
+                    headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "from": "Signum <noreply@signumaiapp.com>",
+                        "to": ["hello@signumaiapp.com"],
+                        "subject": f"🏢 New Team plan request — {req.company}",
+                        "html": f"""
+                        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#0b0f1a;color:#e8edf5;padding:32px;border-radius:12px;">
+                          <h2 style="margin-bottom:20px;">New Team Plan Request</h2>
+                          <table style="width:100%;border-collapse:collapse;">
+                            <tr><td style="padding:8px 0;color:#7a8aaa;width:120px;">Name</td><td style="padding:8px 0;font-weight:600;">{req.name}</td></tr>
+                            <tr><td style="padding:8px 0;color:#7a8aaa;">Email</td><td style="padding:8px 0;font-weight:600;">{req.email}</td></tr>
+                            <tr><td style="padding:8px 0;color:#7a8aaa;">Company</td><td style="padding:8px 0;font-weight:600;">{req.company}</td></tr>
+                            <tr><td style="padding:8px 0;color:#7a8aaa;">Team size</td><td style="padding:8px 0;font-weight:600;">{req.team_size or 'Not specified'}</td></tr>
+                          </table>
+                          <div style="margin-top:24px;padding:16px;background:#131929;border-radius:8px;border:1px solid #1e2d4a;">
+                            <p style="margin:0;font-size:13px;color:#7a8aaa;">Reply to <strong style="color:#e8edf5;">{req.email}</strong> within 24 hours.</p>
+                          </div>
+                        </div>
+                        """,
+                        "reply_to": req.email,
+                    },
+                    timeout=10,
+                )
+
+            # Also send confirmation to the requester
+            await send_email(
+                req.email,
+                "Your Signum Team request is received",
+                signum_email_base(f"""
+                  <h1 style="font-size:22px;font-weight:700;margin:0 0 12px;letter-spacing:-0.5px;">We got your request.</h1>
+                  <p style="font-size:15px;line-height:1.7;color:#7a8aaa;margin:0 0 8px;">
+                    Hi {req.name}, thanks for your interest in Signum Team for <strong style="color:#e8edf5;">{req.company}</strong>.
+                  </p>
+                  <p style="font-size:15px;line-height:1.7;color:#7a8aaa;margin:0 0 28px;">
+                    We'll set up your team account and be in touch within 24 hours.
+                  </p>
+                  <a href="https://signumaiapp.com" style="display:inline-block;background:linear-gradient(135deg,#6366f1,#818cf8);color:#fff;font-weight:600;font-size:14px;padding:12px 24px;border-radius:8px;text-decoration:none;">Go to Signum →</a>
+                """)
+            )
+
+        logger.info(f"Team contact: {req.email} — {req.company}")
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Team contact error: {e}")
+        return {"ok": False, "error": str(e)}
+
+@app.post("/webhook/email")
+async def email_webhook(req: EmailWebhookRequest):
+    """Supabase Database Webhook → triggers lifecycle emails."""
+    try:
+        event_type = req.type
+        record = req.record
+
+        if event_type == "INSERT" and "email" in record:
+            # New user registered
+            email = record.get("email", "")
+            if email:
+                await send_welcome_email(email)
+                logger.info(f"Welcome email sent to {email}")
+
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Email webhook error: {e}")
+        return {"ok": False, "error": str(e)}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STRIPE ENDPOINTS
