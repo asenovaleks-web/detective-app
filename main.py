@@ -74,6 +74,9 @@ STRIPE_SECRET     = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK    = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_ID   = os.environ.get("STRIPE_PRICE_ID", "price_1T3cu8ACEfVvmWmy3Q6tZGFh")
 FRONTEND_URL      = os.environ.get("FRONTEND_URL", "https://signumaiapp.com")
+IPQS_KEY          = os.environ.get("IPQS_TOKEN", "")
+ABUSEIPDB_KEY     = os.environ.get("ABUSEIPDB_TOKEN", "")
+OTX_KEY           = os.environ.get("OTX_TOKEN", "")
 
 FREE_DAILY_LIMIT  = 3
 
