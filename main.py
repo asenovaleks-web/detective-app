@@ -1445,26 +1445,30 @@ async def report_site(req: SiteReportRequest, authorization: str = Header(None))
     cat_label = category_labels.get(req.category, req.category)
 
     try:
-        # Log to Supabase
+        # Log to Supabase — wrapped separately so email still fires if table missing
         if SUPABASE_URL:
-            async with httpx.AsyncClient() as client:
-                await client.post(
-                    f"{SUPABASE_URL}/rest/v1/site_reports",
-                    headers={
-                        "apikey": SUPABASE_SERVICE,
-                        "Authorization": f"Bearer {SUPABASE_SERVICE}",
-                        "Content-Type": "application/json",
-                        "Prefer": "return=minimal",
-                    },
-                    json={
-                        "domain": req.domain,
-                        "category": req.category,
-                        "details": req.details,
-                        "user_id": user.get("id"),
-                        "reported_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                    timeout=5,
-                )
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        f"{SUPABASE_URL}/rest/v1/site_reports",
+                        headers={
+                            "apikey": SUPABASE_SERVICE,
+                            "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                            "Content-Type": "application/json",
+                            "Prefer": "return=minimal",
+                        },
+                        json={
+                            "domain": req.domain,
+                            "category": req.category,
+                            "details": req.details,
+                            "user_id": user.get("id"),
+                            "reported_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                        timeout=5,
+                    )
+                    logger.info(f"Supabase report insert: {resp.status_code}")
+            except Exception as db_err:
+                logger.warning(f"Supabase site_reports insert failed (table may not exist yet): {db_err}")
 
         # Email notification
         RESEND_KEY = _env.get("RESEND_API_KEY", "")
