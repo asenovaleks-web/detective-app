@@ -1419,6 +1419,88 @@ class TeamContactRequest(BaseModel):
     company: str
     team_size: str = ""
 
+
+
+class SiteReportRequest(BaseModel):
+    domain: str
+    category: str  # fake_shop, phishing, scam, malware, other
+    details: str = ""
+
+@app.post("/report-site")
+async def report_site(req: SiteReportRequest, authorization: str = Header(None)):
+    """Handle site reports from registered users."""
+    # Verify user
+    token = authorization.replace("Bearer ", "") if authorization else ""
+    user = await get_user_from_token(token) if token else None
+    if not user:
+        raise HTTPException(status_code=401, detail="Sign in to submit reports")
+
+    category_labels = {
+        "fake_shop": "🛒 Fake Shop",
+        "phishing": "🎣 Phishing",
+        "scam": "💸 Scam / Ponzi",
+        "malware": "🦠 Malware",
+        "other": "⚠️ Other",
+    }
+    cat_label = category_labels.get(req.category, req.category)
+
+    try:
+        # Log to Supabase
+        if SUPABASE_URL:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{SUPABASE_URL}/rest/v1/site_reports",
+                    headers={
+                        "apikey": SUPABASE_SERVICE,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                        "Content-Type": "application/json",
+                        "Prefer": "return=minimal",
+                    },
+                    json={
+                        "domain": req.domain,
+                        "category": req.category,
+                        "details": req.details,
+                        "user_id": user.get("id"),
+                        "reported_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    timeout=5,
+                )
+
+        # Email notification
+        RESEND_KEY = _env.get("RESEND_API_KEY", "")
+        if RESEND_KEY:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    "https://api.resend.com/emails",
+                    headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "from": "Signum <noreply@signumaiapp.com>",
+                        "to": ["asenovaleks@yahoo.com"],
+                        "subject": f"{cat_label} — Site reported: {req.domain}",
+                        "html": f"""
+                        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#0b0f1a;color:#e8edf5;padding:32px;border-radius:12px;">
+                          <h2 style="margin-bottom:20px;color:#ef4444;">⚑ New Site Report</h2>
+                          <table style="width:100%;border-collapse:collapse;">
+                            <tr><td style="padding:8px 0;color:#7a8aaa;width:120px;">Domain</td><td style="padding:8px 0;font-weight:600;font-family:monospace;color:#3b82f6;">{req.domain}</td></tr>
+                            <tr><td style="padding:8px 0;color:#7a8aaa;">Category</td><td style="padding:8px 0;font-weight:600;">{cat_label}</td></tr>
+                            <tr><td style="padding:8px 0;color:#7a8aaa;">Reported by</td><td style="padding:8px 0;">{user.get('email', 'Unknown')}</td></tr>
+                            <tr><td style="padding:8px 0;color:#7a8aaa;">Details</td><td style="padding:8px 0;color:#7a8aaa;">{req.details or 'No details provided'}</td></tr>
+                          </table>
+                          <div style="margin-top:24px;">
+                            <a href="https://signumaiapp.com/?domain={req.domain}" style="display:inline-block;background:#3b82f6;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;">Scan this domain →</a>
+                          </div>
+                        </div>
+                        """,
+                    },
+                    timeout=10,
+                )
+
+        logger.info(f"Site report: {req.domain} — {req.category} by {user.get('email')}")
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Report site error: {e}")
+        return {"ok": False, "error": str(e)}
+
 @app.post("/team-contact")
 async def team_contact(req: TeamContactRequest):
     """Handle Team plan contact requests — notify via email."""
@@ -1431,7 +1513,7 @@ async def team_contact(req: TeamContactRequest):
                     headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
                     json={
                         "from": "Signum <noreply@signumaiapp.com>",
-                        "to": ["hello@signumaiapp.com"],
+                        "to": ["asenovaleks@yahoo.com"],
                         "subject": f"🏢 New Team plan request — {req.company}",
                         "html": f"""
                         <div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#0b0f1a;color:#e8edf5;padding:32px;border-radius:12px;">
