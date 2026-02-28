@@ -1505,6 +1505,54 @@ async def report_site(req: SiteReportRequest, authorization: str = Header(None))
         logger.error(f"Report site error: {e}")
         return {"ok": False, "error": str(e)}
 
+
+
+class ContactRequest(BaseModel):
+    name: str
+    email: str
+    subject: str
+    message: str
+
+@app.post("/contact")
+async def contact_form(req: ContactRequest):
+    """Handle contact form submissions."""
+    try:
+        RESEND_KEY = _env.get("RESEND_API_KEY", "")
+        if RESEND_KEY:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    "https://api.resend.com/emails",
+                    headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "from": "Signum Contact <noreply@signumaiapp.com>",
+                        "to": ["asenovaleks@yahoo.com"],
+                        "reply_to": req.email,
+                        "subject": f"[Contact] {req.subject} — from {req.name}",
+                        "html": f"""
+                        <div style="font-family:sans-serif;max-width:520px;margin:0 auto;background:#0b0f1a;color:#e8edf5;padding:32px;border-radius:12px;">
+                          <h2 style="margin-bottom:20px;color:#3b82f6;">✉️ New Contact Message</h2>
+                          <table style="width:100%;border-collapse:collapse;">
+                            <tr><td style="padding:8px 0;color:#7a8aaa;width:100px;">From</td><td style="padding:8px 0;font-weight:600;">{req.name}</td></tr>
+                            <tr><td style="padding:8px 0;color:#7a8aaa;">Email</td><td style="padding:8px 0;"><a href="mailto:{req.email}" style="color:#3b82f6;">{req.email}</a></td></tr>
+                            <tr><td style="padding:8px 0;color:#7a8aaa;">Subject</td><td style="padding:8px 0;">{req.subject}</td></tr>
+                          </table>
+                          <div style="margin-top:20px;padding:16px;background:#131c2e;border:1px solid #1e2d4a;border-radius:8px;color:#7a8aaa;line-height:1.6;">
+                            {req.message}
+                          </div>
+                          <div style="margin-top:20px;">
+                            <a href="mailto:{req.email}?subject=Re: {req.subject}" style="display:inline-block;background:#3b82f6;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;">Reply to {req.name} →</a>
+                          </div>
+                        </div>
+                        """,
+                    },
+                    timeout=10,
+                )
+        logger.info(f"Contact form: {req.name} <{req.email}> — {req.subject}")
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Contact form error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send message")
+
 @app.post("/team-contact")
 async def team_contact(req: TeamContactRequest):
     """Handle Team plan contact requests — notify via email."""
