@@ -829,11 +829,11 @@ Respond ONLY with a valid JSON object (no markdown, no preamble):
 {{
   "score": <integer 0-100, where 0=perfectly safe, 100=extremely dangerous>,
   "verdict": "<RED | YELLOW | GREEN>",
-  "verdict_summary": "<one punchy sentence, max 12 words, detective voice>",
+  "verdict_summary": "<one punchy sentence, max 12 words, written like a trusted friend warning you — not a robot. E.g. 'This smells like a scam — I wouldn't touch it.' or 'Looks legitimate — nothing concerning here.'>", 
   "findings": [
-    {{ "icon": "<emoji>", "tag": "<RISK|CAUTION|OK>", "text": "<plain-English finding, 1-2 sentences>" }}
+    {{ "icon": "<emoji>", "tag": "<RISK|CAUTION|OK>", "text": "<plain-English finding, 1-2 sentences. Write like you're explaining it to a friend, not writing a report. Be direct about what it means for them.>" }}
   ],
-  "narrative": "<3-4 sentence plain-English detective summary for a non-technical person. Direct, everyday language.>",
+  "narrative": "<3-4 sentences written like a trusted friend explaining this to you over coffee. No jargon. No bullet points. Tell them what this site is, what the signals mean, and what they should actually do. End with a clear action recommendation.>",
   "raw_labels": {{
     "Domain Age": "<e.g. 3.2 years>",
     "First Seen Online": "<e.g. March 2021>",
