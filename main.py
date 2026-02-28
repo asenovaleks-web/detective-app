@@ -975,6 +975,34 @@ def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_da
     return score, confidence
 
 
+async def save_scan_result(user_id: str, domain: str, result: dict):
+    """Save full scan result JSON for instant reload."""
+    if not SUPABASE_URL or not user_id:
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            # Delete old results for this domain (keep only latest)
+            await client.delete(
+                f"{SUPABASE_URL}/rest/v1/scan_results?user_id=eq.{user_id}&domain=eq.{domain}",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                timeout=5,
+            )
+            # Insert new result
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/scan_results",
+                headers={
+                    "apikey": SUPABASE_SERVICE,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                json={"user_id": user_id, "domain": domain, "result_json": result},
+                timeout=5,
+            )
+    except Exception as e:
+        logger.warning(f"save_scan_result failed: {e}")
+
+
 async def update_watchlist_scores(domain: str, score: int, verdict: str):
     """Update watchlist scores and send alert emails if verdict changed."""
     if not SUPABASE_URL:
@@ -1204,6 +1232,20 @@ async def investigate(req: InvestigateRequest):
                         # Third scan — upgrade nudge
                         asyncio.create_task(send_upgrade_nudge_email(user_email))
 
+        # ── Save full result for instant reload ──────────────────────────
+        if user_id:
+            result_dict = {
+                "target": req.target,
+                "score": final_score,
+                "verdict": final_verdict,
+                "verdict_summary": analysis.get("verdict_summary", ""),
+                "findings": analysis.get("findings", []),
+                "narrative": analysis.get("narrative", ""),
+                "raw_labels": analysis.get("raw_labels", {}),
+                "data_confidence": data_confidence,
+            }
+            asyncio.create_task(save_scan_result(user_id, domain, result_dict))
+
         # ── Upsert domain scan stats ──────────────────────────────────────
         await upsert_domain_scan(domain, final_score, final_verdict)
 
@@ -1240,6 +1282,31 @@ async def investigate(req: InvestigateRequest):
     except Exception as e:
         logger.error(f"Investigation failed: {str(e)}")
         logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/scan-result")
+async def get_scan_result(domain: str, authorization: str = Header(None)):
+    """Get the last full scan result for a domain."""
+    token = authorization.replace("Bearer ", "") if authorization else ""
+    user = await get_user_from_token(token) if token else None
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        clean = domain.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0].split("?")[0]
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/scan_results?user_id=eq.{user['id']}&domain=eq.{clean}&order=created_at.desc&limit=1",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                timeout=5,
+            )
+            data = r.json()
+            if data and len(data) > 0:
+                return data[0]["result_json"]
+            raise HTTPException(status_code=404, detail="No cached result")
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1518,37 +1585,44 @@ async def contact_form(req: ContactRequest):
     """Handle contact form submissions."""
     try:
         RESEND_KEY = _env.get("RESEND_API_KEY", "")
-        if RESEND_KEY:
-            async with httpx.AsyncClient() as client:
-                await client.post(
-                    "https://api.resend.com/emails",
-                    headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
-                    json={
-                        "from": "Signum Contact <noreply@signumaiapp.com>",
-                        "to": ["asenovaleks@yahoo.com"],
-                        "reply_to": req.email,
-                        "subject": f"[Contact] {req.subject} — from {req.name}",
-                        "html": f"""
-                        <div style="font-family:sans-serif;max-width:520px;margin:0 auto;background:#0b0f1a;color:#e8edf5;padding:32px;border-radius:12px;">
-                          <h2 style="margin-bottom:20px;color:#3b82f6;">✉️ New Contact Message</h2>
-                          <table style="width:100%;border-collapse:collapse;">
-                            <tr><td style="padding:8px 0;color:#7a8aaa;width:100px;">From</td><td style="padding:8px 0;font-weight:600;">{req.name}</td></tr>
-                            <tr><td style="padding:8px 0;color:#7a8aaa;">Email</td><td style="padding:8px 0;"><a href="mailto:{req.email}" style="color:#3b82f6;">{req.email}</a></td></tr>
-                            <tr><td style="padding:8px 0;color:#7a8aaa;">Subject</td><td style="padding:8px 0;">{req.subject}</td></tr>
-                          </table>
-                          <div style="margin-top:20px;padding:16px;background:#131c2e;border:1px solid #1e2d4a;border-radius:8px;color:#7a8aaa;line-height:1.6;">
-                            {req.message}
-                          </div>
-                          <div style="margin-top:20px;">
-                            <a href="mailto:{req.email}?subject=Re: {req.subject}" style="display:inline-block;background:#3b82f6;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;">Reply to {req.name} →</a>
-                          </div>
-                        </div>
-                        """,
-                    },
-                    timeout=10,
-                )
-        logger.info(f"Contact form: {req.name} <{req.email}> — {req.subject}")
+        if not RESEND_KEY:
+            logger.error("Contact form: no RESEND_API_KEY configured")
+            raise HTTPException(status_code=500, detail="Email service not configured")
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
+                json={
+                    "from": "Signum Contact <noreply@signumaiapp.com>",
+                    "to": ["asenovaleks@yahoo.com"],
+                    "reply_to": req.email,
+                    "subject": f"[Contact] {req.subject} — from {req.name}",
+                    "html": f"""
+                    <div style="font-family:sans-serif;max-width:520px;margin:0 auto;background:#0b0f1a;color:#e8edf5;padding:32px;border-radius:12px;">
+                      <h2 style="margin-bottom:20px;color:#3b82f6;">✉️ New Contact Message</h2>
+                      <table style="width:100%;border-collapse:collapse;">
+                        <tr><td style="padding:8px 0;color:#7a8aaa;width:100px;">From</td><td style="padding:8px 0;font-weight:600;">{req.name}</td></tr>
+                        <tr><td style="padding:8px 0;color:#7a8aaa;">Email</td><td style="padding:8px 0;"><a href="mailto:{req.email}" style="color:#3b82f6;">{req.email}</a></td></tr>
+                        <tr><td style="padding:8px 0;color:#7a8aaa;">Subject</td><td style="padding:8px 0;">{req.subject}</td></tr>
+                      </table>
+                      <div style="margin-top:20px;padding:16px;background:#131c2e;border:1px solid #1e2d4a;border-radius:8px;color:#7a8aaa;line-height:1.6;">
+                        {req.message}
+                      </div>
+                      <div style="margin-top:20px;">
+                        <a href="mailto:{req.email}?subject=Re: {req.subject}" style="display:inline-block;background:#3b82f6;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;">Reply to {req.name} →</a>
+                      </div>
+                    </div>
+                    """,
+                },
+                timeout=10,
+            )
+            if r.status_code >= 400:
+                logger.error(f"Resend error: {r.status_code} {r.text}")
+                raise HTTPException(status_code=500, detail="Failed to send email")
+        logger.info(f"Contact form sent: {req.name} <{req.email}> — {req.subject}")
         return {"ok": True}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Contact form error: {e}")
         raise HTTPException(status_code=500, detail="Failed to send message")
