@@ -2168,7 +2168,7 @@ signumaiapp.com"""
         logger.error(f"deliver_paid_scan failed: {e}")
 
 # ==================== PDF REPORT GENERATOR ====================
-import io as _io
+import io
 from reportlab.lib.pagesizes import A4 as _A4
 from reportlab.lib import colors as _colors
 from reportlab.lib.units import mm as _mm
@@ -2201,7 +2201,7 @@ def generate_pdf_report(result: dict, diff: list = None) -> bytes:
     TEXT=_colors.HexColor("#e2e8f0"); MUTED=_colors.HexColor("#94a3b8"); FAINT=_colors.HexColor("#475569")
     W,H=_A4; M=15*_mm
 
-    buf = _io.BytesIO()
+    buf = io.BytesIO()
     c = _canvas.Canvas(buf, pagesize=_A4)
 
     for page_num in [1, 2]:
@@ -2216,27 +2216,28 @@ def generate_pdf_report(result: dict, diff: list = None) -> bytes:
 
         if page_num == 1:
             # Logo + meta
-            c.setFillColor(BLUE); c.setFont("Helvetica-Bold",18); c.drawString(M,H-18*_mm,"SIGNUM")
-            c.setFillColor(MUTED); c.setFont("Helvetica",8); c.drawString(M,H-25*_mm,"AI TRUST INTELLIGENCE REPORT")
+            c.setFillColor(BLUE); c.setFont("Helvetica-Bold",18); c.drawString(M,H-15*_mm,"SIGNUM")
+            c.setFillColor(MUTED); c.setFont("Helvetica",8); c.drawString(M,H-22*_mm,"AI TRUST INTELLIGENCE REPORT")
             c.setFillColor(FAINT); c.setFont("Helvetica",8)
-            c.drawRightString(W-M,H-18*_mm,f"Generated: {scan_date}")
-            c.drawRightString(W-M,H-25*_mm,"signumaiapp.com")
+            c.drawRightString(W-M,H-15*_mm,f"Generated: {scan_date}")
+            c.drawRightString(W-M,H-22*_mm,"signumaiapp.com")
             # Domain
-            c.setFillColor(_colors.white); c.setFont("Helvetica-Bold",22); c.drawString(M,H-40*_mm,domain)
-            # Verdict badge
-            bl={"GREEN":"✓  TRUSTED","YELLOW":"⚠  CAUTION","RED":"✕  HIGH RISK"}
-            c.setFillColor(_vbg(verdict)); c.roundRect(M,H-54*_mm,32*_mm,9*_mm,2*_mm,fill=1,stroke=0)
-            c.setFillColor(v_color); c.setFont("Helvetica-Bold",9); c.drawCentredString(M+16*_mm,H-50.5*_mm,bl.get(verdict,verdict))
-            # Score circle
-            cx=W-35*_mm; cy=H-35*_mm; ro=18*_mm; ri=13*_mm
+            c.setFillColor(_colors.white); c.setFont("Helvetica-Bold",20); c.drawString(M,H-35*_mm,domain)
+            # Verdict badge — below domain, left aligned, no overlap
+            bl={"GREEN":"TRUSTED","YELLOW":"CAUTION","RED":"HIGH RISK"}
+            badge_text=bl.get(verdict,verdict)
+            bw=len(badge_text)*5.5+14
+            c.setFillColor(_vbg(verdict)); c.roundRect(M,H-47*_mm,bw*_mm,8*_mm,1.5*_mm,fill=1,stroke=0)
+            c.setFillColor(v_color); c.setFont("Helvetica-Bold",8); c.drawString(M+4*_mm,H-43.5*_mm,badge_text)
+            # Score circle — right side, vertically centered in header
+            cx=W-32*_mm; cy=H-31*_mm; ro=17*_mm; ri=12*_mm
             c.setFillColor(SURF); c.circle(cx,cy,ro,fill=1,stroke=0)
             c.setStrokeColor(v_color); c.setLineWidth(3*_mm)
             c.arc(cx-ro+1.5*_mm,cy-ro+1.5*_mm,cx+ro-1.5*_mm,cy+ro-1.5*_mm,90,-360*(score/100))
             c.setLineWidth(1); c.setFillColor(BG2); c.circle(cx,cy,ri,fill=1,stroke=0)
-            c.setFillColor(v_color); c.setFont("Helvetica-Bold",24); c.drawCentredString(cx,cy+2*_mm,str(score))
-            c.setFillColor(MUTED); c.setFont("Helvetica-Bold",6)
+            c.setFillColor(v_color); c.setFont("Helvetica-Bold",22); c.drawCentredString(cx,cy+1.5*_mm,str(score))
             sl=("LOW RISK" if score<35 else "MODERATE RISK" if score<65 else "HIGH RISK")
-            c.drawCentredString(cx,cy-5*_mm,sl)
+            c.setFillColor(MUTED); c.setFont("Helvetica-Bold",6); c.drawCentredString(cx,cy-5.5*_mm,sl)
 
             # Summary box
             y=H-72*_mm
