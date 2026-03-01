@@ -2566,6 +2566,60 @@ body{{background:#0a0f1e;color:#e2e8f0;font-family:"DM Sans",sans-serif;min-heig
     return HTMLResponse(content=html)
 
 
+@app.get("/trending-threats")
+async def trending_threats():
+    """Top high-risk domains scanned by users in the last 7 days."""
+    if not SUPABASE_URL:
+        return {"threats": []}
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/scan_results",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                params={
+                    "select": "domain,result_json",
+                    "created_at": f"gte.{cutoff}",
+                    "order": "created_at.desc",
+                    "limit": "500"
+                },
+                timeout=10,
+            )
+            rows = r.json() if r.status_code == 200 else []
+
+        # Aggregate by domain
+        from collections import defaultdict
+        domain_data = defaultdict(lambda: {"scores": [], "count": 0, "verdict": "GREEN"})
+        for row in rows:
+            d = row.get("domain", "")
+            rj = row.get("result_json", {})
+            score = rj.get("score", 0)
+            verdict = rj.get("verdict", "GREEN")
+            if not d: continue
+            domain_data[d]["scores"].append(score)
+            domain_data[d]["count"] += 1
+            domain_data[d]["verdict"] = verdict
+
+        # Filter RED/YELLOW, sort by count then score
+        threats = []
+        for domain, data in domain_data.items():
+            avg_score = int(sum(data["scores"]) / len(data["scores"]))
+            if avg_score >= 50:
+                threats.append({
+                    "domain": domain,
+                    "score": avg_score,
+                    "count": data["count"],
+                    "verdict": data["verdict"]
+                })
+
+        threats.sort(key=lambda x: (x["count"], x["score"]), reverse=True)
+        return {"threats": threats[:10]}
+    except Exception as e:
+        logger.error(f"trending_threats error: {e}")
+        return {"threats": []}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
