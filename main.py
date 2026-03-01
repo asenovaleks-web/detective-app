@@ -2262,21 +2262,30 @@ def generate_pdf_report(result: dict, diff: list = None) -> bytes:
                         bg=_colors.HexColor("#111827") if i%2==0 else _colors.HexColor("#0f172a")
                         c.setFillColor(bg); c.roundRect(ox,ry-rh+1*_mm,cw,rh-1*_mm,1.5*_mm,fill=1,stroke=0)
                         c.setFillColor(MUTED); c.setFont("Helvetica",8); c.drawString(ox+3*_mm,ry-4*_mm,str(k))
-                        c.setFillColor(_fc(v)); c.setFont("Helvetica-Bold",8); c.drawRightString(ox+cw-3*_mm,ry-4*_mm,str(v)[:38])
+                        c.setFillColor(_fc(v)); c.setFont("Helvetica-Bold",7.5); c.drawRightString(ox+cw-3*_mm,ry-4*_mm,str(v)[:42])
             y-=(max(len(left),len(right))*rh)+6*_mm
 
             # Findings
             if y>50*_mm:
                 c.setFillColor(MUTED); c.setFont("Helvetica-Bold",8); c.drawString(M,y,"KEY FINDINGS")
                 c.setFillColor(BDR); c.rect(M,y-2*_mm,W-2*M,0.3*_mm,fill=1,stroke=0); y-=7*_mm
-                for f in result.get("findings",[])[:6]:
+                for f in result.get("findings",[])[:8]:
                     if y<35*_mm: break
-                    fc2=_colors.HexColor("#ef4444") if f.get("flag") else _colors.HexColor("#22c55e")
-                    c.setFillColor(SURF); c.roundRect(M,y-6*_mm,W-2*M,7*_mm,1.5*_mm,fill=1,stroke=0)
-                    c.setFillColor(fc2); c.setFont("Helvetica-Bold",9); c.drawString(M+3*_mm,y-3*_mm,"▲" if f.get("flag") else "✓")
-                    c.setFillColor(TEXT); c.setFont("Helvetica-Bold",9); c.drawString(M+9*_mm,y-3*_mm,str(f.get("label","")))
-                    c.setFillColor(fc2); c.setFont("Helvetica",9); c.drawRightString(W-M-3*_mm,y-3*_mm,str(f.get("value","")))
-                    y-=8*_mm
+                    tag=f.get("tag","OK"); is_risk=(tag in ("RISK","CAUTION"))
+                    fc2=_colors.HexColor("#ef4444") if tag=="RISK" else (_colors.HexColor("#f59e0b") if tag=="CAUTION" else _colors.HexColor("#22c55e"))
+                    icon_str = "!" if tag=="RISK" else ("~" if tag=="CAUTION" else "+")
+                    text=str(f.get("text",""))
+                    tlines = _wrap(text, 80)
+                    row_h = (len(tlines)*5 + 8)*_mm
+                    c.setFillColor(SURF); c.roundRect(M,y-row_h,W-2*M,row_h,1.5*_mm,fill=1,stroke=0)
+                    c.setFillColor(fc2); c.setFont("Helvetica-Bold",10); c.drawString(M+3*_mm,y-4*_mm,icon_str)
+                    ty2 = y-4*_mm
+                    for tl in tlines:
+                        c.setFillColor(TEXT if tlines.index(tl)==0 else MUTED)
+                        c.setFont("Helvetica-Bold" if tlines.index(tl)==0 else "Helvetica", 8.5)
+                        c.drawString(M+9*_mm, ty2, tl)
+                        ty2 -= 5*_mm
+                    y -= row_h + 2*_mm
 
         else:  # Page 2
             c.setFillColor(BLUE); c.setFont("Helvetica-Bold",12); c.drawString(M,H-12*_mm,"SIGNUM")
@@ -2298,17 +2307,26 @@ def generate_pdf_report(result: dict, diff: list = None) -> bytes:
 
             # Remaining findings
             findings=result.get("findings",[])
-            if len(findings)>6:
+            if len(findings)>8:
                 c.setFillColor(MUTED); c.setFont("Helvetica-Bold",8); c.drawString(M,y,"ADDITIONAL FINDINGS")
                 c.setFillColor(BDR); c.rect(M,y-2*_mm,W-2*M,0.3*_mm,fill=1,stroke=0); y-=7*_mm
-                for f in findings[6:]:
+                for f in findings[8:]:
                     if y<40*_mm: break
-                    fc2=_colors.HexColor("#ef4444") if f.get("flag") else _colors.HexColor("#22c55e")
-                    c.setFillColor(SURF); c.roundRect(M,y-6*_mm,W-2*M,7*_mm,1.5*_mm,fill=1,stroke=0)
-                    c.setFillColor(fc2); c.setFont("Helvetica-Bold",9); c.drawString(M+3*_mm,y-3*_mm,"▲" if f.get("flag") else "✓")
-                    c.setFillColor(TEXT); c.setFont("Helvetica-Bold",9); c.drawString(M+9*_mm,y-3*_mm,str(f.get("label","")))
-                    c.setFillColor(fc2); c.setFont("Helvetica",9); c.drawRightString(W-M-3*_mm,y-3*_mm,str(f.get("value","")))
-                    y-=8*_mm
+                    tag=f.get("tag","OK"); is_risk=(tag in ("RISK","CAUTION"))
+                    fc2=_colors.HexColor("#ef4444") if tag=="RISK" else (_colors.HexColor("#f59e0b") if tag=="CAUTION" else _colors.HexColor("#22c55e"))
+                    icon_str = "!" if tag=="RISK" else ("~" if tag=="CAUTION" else "+")
+                    text=str(f.get("text",""))
+                    tlines = _wrap(text, 80)
+                    row_h = (len(tlines)*5 + 8)*_mm
+                    c.setFillColor(SURF); c.roundRect(M,y-row_h,W-2*M,row_h,1.5*_mm,fill=1,stroke=0)
+                    c.setFillColor(fc2); c.setFont("Helvetica-Bold",10); c.drawString(M+3*_mm,y-4*_mm,icon_str)
+                    ty2 = y-4*_mm
+                    for tl in tlines:
+                        c.setFillColor(TEXT if tlines.index(tl)==0 else MUTED)
+                        c.setFont("Helvetica-Bold" if tlines.index(tl)==0 else "Helvetica", 8.5)
+                        c.drawString(M+9*_mm, ty2, tl)
+                        ty2 -= 5*_mm
+                    y -= row_h + 2*_mm
                 y-=4*_mm
 
             # What changed
