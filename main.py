@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -66,7 +67,8 @@ SUPABASE_SERVICE  = _env.get("SUPABASE_SERVICE_KEY", "")
 SUPABASE_ANON     = _env.get("SUPABASE_ANON_KEY", "")
 STRIPE_SECRET     = _env.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK    = _env.get("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_PRICE_ID   = _env.get("STRIPE_PRICE_ID", "price_1T3cu8ACEfVvmWmy3Q6tZGFh")
+STRIPE_PRICE_ID       = _env.get("STRIPE_PRICE_ID", "price_1T3cu8ACEfVvmWmy3Q6tZGFh")
+STRIPE_ONETIMESCAN_ID = _env.get("STRIPE_ONETIMESCAN_ID", "")  # One-time €4.99 scan report
 FRONTEND_URL      = _env.get("FRONTEND_URL", "https://signumaiapp.com")
 IPQS_KEY          = _env.get("IPQS_KEY", "")
 ABUSEIPDB_KEY     = _env.get("ABUSEIPDB_KEY", "")
@@ -1912,9 +1914,51 @@ async def email_webhook(req: EmailWebhookRequest):
 # STRIPE ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
+class SingleScanRequest(BaseModel):
+    domain: str
+    user_email: str = ""
+
 class CheckoutRequest(BaseModel):
     user_token: str
     user_email: str
+
+
+@app.post("/create-scan-checkout")
+async def create_scan_checkout(req: SingleScanRequest):
+    """One-time payment for a single domain report — no account required."""
+    if not STRIPE_SECRET:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    if not STRIPE_ONETIMESCAN_ID:
+        raise HTTPException(status_code=500, detail="One-time scan price not configured")
+
+    domain = req.domain.lower().replace("https://","").replace("http://","").split("/")[0]
+    if not domain:
+        raise HTTPException(status_code=400, detail="Invalid domain")
+
+    async with httpx.AsyncClient() as client:
+        data = {
+            "mode": "payment",
+            "line_items[0][price]": STRIPE_ONETIMESCAN_ID,
+            "line_items[0][quantity]": "1",
+            "success_url": f"{FRONTEND_URL}?scan_paid=1&domain={domain}",
+            "cancel_url": f"{FRONTEND_URL}?scan_paid=cancelled",
+            "metadata[domain]": domain,
+            "payment_intent_data[metadata][domain]": domain,
+            "payment_intent_data[metadata][type]": "single_scan",
+        }
+        if req.user_email:
+            data["customer_email"] = req.user_email
+
+        r = await client.post(
+            "https://api.stripe.com/v1/checkout/sessions",
+            auth=(STRIPE_SECRET, ""),
+            data=data,
+            timeout=15,
+        )
+    result = r.json()
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"]["message"])
+    return {"checkout_url": result["url"]}
 
 @app.post("/create-checkout-session")
 async def create_checkout_session(req: CheckoutRequest):
@@ -1986,6 +2030,16 @@ async def stripe_webhook(request: Request):
                 await upgrade_user_to_pro(user_id)
                 logger.info(f"Upgraded user {user_id} to Pro")
 
+        elif event_type == "checkout.session.completed":
+            obj = event.get("data", {}).get("object", {})
+            if obj.get("mode") == "payment":
+                domain = obj.get("metadata", {}).get("domain", "")
+                customer_email = obj.get("customer_details", {}).get("email", "")
+                logger.info(f"One-time scan paid for {domain} by {customer_email}")
+                # Trigger scan and email PDF
+                if domain and customer_email:
+                    asyncio.create_task(deliver_paid_scan(domain, customer_email))
+
         elif event_type in ("customer.subscription.deleted", "invoice.payment_failed"):
             obj = event.get("data", {}).get("object", {})
             user_id = obj.get("metadata", {}).get("user_id")
@@ -2029,6 +2083,487 @@ async def downgrade_user_to_free(user_id: str):
             json={"plan": "free", "subscription_status": "inactive"},
             timeout=10,
         )
+
+
+async def deliver_paid_scan(domain: str, email: str):
+    """Run scan + generate PDF + email to customer after one-time payment."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email.mime.text import MIMEText
+    from email import encoders
+
+    logger.info(f"Delivering paid scan for {domain} to {email}")
+    try:
+        # Run the scan
+        class FakeReq:
+            target = domain
+            user_token = None
+        req = FakeReq()
+        # Use investigate logic directly
+        async with httpx.AsyncClient(timeout=30) as client:
+            scan_result = None
+            # Check if we have a recent cached scan
+            async with httpx.AsyncClient() as c:
+                r = await c.get(
+                    f"{SUPABASE_URL}/rest/v1/scan_results",
+                    headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                    params={"domain": f"eq.{domain}", "order": "created_at.desc", "limit": "1"},
+                    timeout=5,
+                )
+                rows = r.json() if r.status_code == 200 else []
+                if rows:
+                    scan_result = rows[0].get("result_json", {})
+                    scan_result["target"] = domain
+
+        if not scan_result:
+            logger.warning(f"No scan result for {domain}, cannot deliver paid report")
+            return
+
+        # Generate PDF
+        pdf_bytes = generate_pdf_report(scan_result)
+
+        # Send email with PDF attachment
+        SMTP_USER = os.environ.get("SMTP_USER", "")
+        SMTP_PASS = os.environ.get("SMTP_PASS", "")
+        if not SMTP_USER:
+            logger.warning("SMTP not configured, cannot send paid scan email")
+            return
+
+        msg = MIMEMultipart()
+        msg["From"] = f"Signum <{SMTP_USER}>"
+        msg["To"] = email
+        msg["Subject"] = f"Your Signum Trust Report — {domain}"
+
+        body = f"""Hi,
+
+Thank you for your purchase. Your Signum Trust Intelligence Report for {domain} is attached.
+
+Risk Score: {scan_result.get('score', 'N/A')}/100
+Verdict: {scan_result.get('verdict', 'N/A')}
+
+Summary: {scan_result.get('verdict_summary', '')}
+
+If you need to check more domains or want ongoing monitoring, visit signumaiapp.com.
+
+Best,
+Signum AI
+signumaiapp.com"""
+
+        msg.attach(MIMEText(body, "plain"))
+
+        attachment = MIMEBase("application", "octet-stream")
+        attachment.set_payload(pdf_bytes)
+        encoders.encode_base64(attachment)
+        safe_domain = domain.replace(".", "_")
+        attachment.add_header("Content-Disposition", f"attachment; filename=signum_{safe_domain}.pdf")
+        msg.attach(attachment)
+
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+        logger.info(f"Paid scan report delivered to {email}")
+    except Exception as e:
+        logger.error(f"deliver_paid_scan failed: {e}")
+
+# ==================== PDF REPORT GENERATOR ====================
+import io as _io
+from reportlab.lib.pagesizes import A4 as _A4
+from reportlab.lib import colors as _colors
+from reportlab.lib.units import mm as _mm
+from reportlab.pdfgen import canvas as _canvas
+
+def _wrap(text, max_chars):
+    words = str(text).split()
+    lines, line = [], ""
+    for word in words:
+        test = line + " " + word if line else word
+        if len(test) > max_chars:
+            if line: lines.append(line)
+            line = word
+        else:
+            line = test
+    if line: lines.append(line)
+    return lines
+
+def _vc(v): return {"GREEN":_colors.HexColor("#22c55e"),"YELLOW":_colors.HexColor("#f59e0b"),"RED":_colors.HexColor("#ef4444")}.get(v,_colors.HexColor("#3b82f6"))
+def _vbg(v): return {"GREEN":_colors.HexColor("#14532d"),"YELLOW":_colors.HexColor("#78350f"),"RED":_colors.HexColor("#7f1d1d")}.get(v,_colors.HexColor("#1e3a5f"))
+def _fc(val):
+    v=str(val).lower()
+    if any(x in v for x in ["flagged","malware","phishing","high","detected","suspicious","reports","pulses","changes"]): return _colors.HexColor("#ef4444")
+    if any(x in v for x in ["caution","moderate","unknown","no history","not listed"]): return _colors.HexColor("#f59e0b")
+    return _colors.HexColor("#22c55e")
+
+def generate_pdf_report(result: dict, diff: list = None) -> bytes:
+    BG=_colors.HexColor("#0a0f1e"); BG2=_colors.HexColor("#0f172a"); SURF=_colors.HexColor("#1e293b")
+    SURF2=_colors.HexColor("#162032"); BDR=_colors.HexColor("#1e3a5f"); BLUE=_colors.HexColor("#3b82f6")
+    TEXT=_colors.HexColor("#e2e8f0"); MUTED=_colors.HexColor("#94a3b8"); FAINT=_colors.HexColor("#475569")
+    W,H=_A4; M=15*_mm
+
+    buf = _io.BytesIO()
+    c = _canvas.Canvas(buf, pagesize=_A4)
+
+    for page_num in [1, 2]:
+        c.setFillColor(BG); c.rect(0,0,W,H,fill=1,stroke=0)
+        verdict=result.get("verdict","YELLOW"); score=result.get("score",0)
+        v_color=_vc(verdict); domain=result.get("target","unknown")
+        scan_date=result.get("scanned_at",datetime.now(timezone.utc).strftime("%d %b %Y %H:%M"))
+
+        # Header
+        c.setFillColor(BG2); c.rect(0,H-62*_mm,W,62*_mm,fill=1,stroke=0)
+        c.setFillColor(BLUE); c.rect(0,H-1.5*_mm,W,1.5*_mm,fill=1,stroke=0)
+
+        if page_num == 1:
+            # Logo + meta
+            c.setFillColor(BLUE); c.setFont("Helvetica-Bold",18); c.drawString(M,H-18*_mm,"SIGNUM")
+            c.setFillColor(MUTED); c.setFont("Helvetica",8); c.drawString(M,H-25*_mm,"AI TRUST INTELLIGENCE REPORT")
+            c.setFillColor(FAINT); c.setFont("Helvetica",8)
+            c.drawRightString(W-M,H-18*_mm,f"Generated: {scan_date}")
+            c.drawRightString(W-M,H-25*_mm,"signumaiapp.com")
+            # Domain
+            c.setFillColor(_colors.white); c.setFont("Helvetica-Bold",22); c.drawString(M,H-40*_mm,domain)
+            # Verdict badge
+            bl={"GREEN":"✓  TRUSTED","YELLOW":"⚠  CAUTION","RED":"✕  HIGH RISK"}
+            c.setFillColor(_vbg(verdict)); c.roundRect(M,H-54*_mm,32*_mm,9*_mm,2*_mm,fill=1,stroke=0)
+            c.setFillColor(v_color); c.setFont("Helvetica-Bold",9); c.drawCentredString(M+16*_mm,H-50.5*_mm,bl.get(verdict,verdict))
+            # Score circle
+            cx=W-35*_mm; cy=H-35*_mm; ro=18*_mm; ri=13*_mm
+            c.setFillColor(SURF); c.circle(cx,cy,ro,fill=1,stroke=0)
+            c.setStrokeColor(v_color); c.setLineWidth(3*_mm)
+            c.arc(cx-ro+1.5*_mm,cy-ro+1.5*_mm,cx+ro-1.5*_mm,cy+ro-1.5*_mm,90,-360*(score/100))
+            c.setLineWidth(1); c.setFillColor(BG2); c.circle(cx,cy,ri,fill=1,stroke=0)
+            c.setFillColor(v_color); c.setFont("Helvetica-Bold",24); c.drawCentredString(cx,cy+2*_mm,str(score))
+            c.setFillColor(MUTED); c.setFont("Helvetica-Bold",6)
+            sl=("LOW RISK" if score<35 else "MODERATE RISK" if score<65 else "HIGH RISK")
+            c.drawCentredString(cx,cy-5*_mm,sl)
+
+            # Summary box
+            y=H-72*_mm
+            c.setFillColor(SURF2); c.roundRect(M,y-16*_mm,W-2*M,18*_mm,2*_mm,fill=1,stroke=0)
+            c.setFillColor(BDR); c.roundRect(M,y-16*_mm,W-2*M,18*_mm,2*_mm,fill=0,stroke=1)
+            c.setFillColor(MUTED); c.setFont("Helvetica-Bold",7); c.drawString(M+4*_mm,y-3*_mm,"AI VERDICT SUMMARY")
+            c.setFillColor(TEXT); c.setFont("Helvetica",10)
+            slines=_wrap(result.get("verdict_summary",""),95)
+            for i,sl in enumerate(slines[:2]): c.drawString(M+4*_mm,y-(9+i*6)*_mm,sl)
+
+            # Intelligence sources
+            y=H-97*_mm
+            c.setFillColor(MUTED); c.setFont("Helvetica-Bold",8); c.drawString(M,y,"INTELLIGENCE SOURCES")
+            c.setFillColor(BDR); c.rect(M,y-2*_mm,W-2*M,0.3*_mm,fill=1,stroke=0); y-=7*_mm
+            raw=result.get("raw_labels",{}); items=list(raw.items())
+            half=(len(items)+1)//2; left=items[:half]; right=items[half:]
+            cw=(W-2*M-5*_mm)/2; rh=8*_mm
+            for i in range(max(len(left),len(right))):
+                ry=y-i*rh
+                for col_items, ox in [(left,M),(right,M+cw+5*_mm)]:
+                    if i<len(col_items):
+                        k,v=col_items[i]
+                        bg=_colors.HexColor("#111827") if i%2==0 else _colors.HexColor("#0f172a")
+                        c.setFillColor(bg); c.roundRect(ox,ry-rh+1*_mm,cw,rh-1*_mm,1.5*_mm,fill=1,stroke=0)
+                        c.setFillColor(MUTED); c.setFont("Helvetica",8); c.drawString(ox+3*_mm,ry-4*_mm,str(k))
+                        c.setFillColor(_fc(v)); c.setFont("Helvetica-Bold",8); c.drawRightString(ox+cw-3*_mm,ry-4*_mm,str(v)[:38])
+            y-=(max(len(left),len(right))*rh)+6*_mm
+
+            # Findings
+            if y>50*_mm:
+                c.setFillColor(MUTED); c.setFont("Helvetica-Bold",8); c.drawString(M,y,"KEY FINDINGS")
+                c.setFillColor(BDR); c.rect(M,y-2*_mm,W-2*M,0.3*_mm,fill=1,stroke=0); y-=7*_mm
+                for f in result.get("findings",[])[:6]:
+                    if y<35*_mm: break
+                    fc2=_colors.HexColor("#ef4444") if f.get("flag") else _colors.HexColor("#22c55e")
+                    c.setFillColor(SURF); c.roundRect(M,y-6*_mm,W-2*M,7*_mm,1.5*_mm,fill=1,stroke=0)
+                    c.setFillColor(fc2); c.setFont("Helvetica-Bold",9); c.drawString(M+3*_mm,y-3*_mm,"▲" if f.get("flag") else "✓")
+                    c.setFillColor(TEXT); c.setFont("Helvetica-Bold",9); c.drawString(M+9*_mm,y-3*_mm,str(f.get("label","")))
+                    c.setFillColor(fc2); c.setFont("Helvetica",9); c.drawRightString(W-M-3*_mm,y-3*_mm,str(f.get("value","")))
+                    y-=8*_mm
+
+        else:  # Page 2
+            c.setFillColor(BLUE); c.setFont("Helvetica-Bold",12); c.drawString(M,H-12*_mm,"SIGNUM")
+            c.setFillColor(MUTED); c.setFont("Helvetica",9); c.drawString(M+22*_mm,H-12*_mm,f"— {domain}")
+            c.setFillColor(FAINT); c.setFont("Helvetica",8); c.drawRightString(W-M,H-12*_mm,scan_date)
+            y=H-32*_mm
+
+            # Narrative
+            c.setFillColor(MUTED); c.setFont("Helvetica-Bold",8); c.drawString(M,y,"DETAILED ANALYSIS")
+            c.setFillColor(BDR); c.rect(M,y-2*_mm,W-2*M,0.3*_mm,fill=1,stroke=0); y-=8*_mm
+            nlines=_wrap(result.get("narrative",""),88)
+            bh=len(nlines)*5.5*_mm+8*_mm
+            c.setFillColor(SURF2); c.roundRect(M,y-bh,W-2*M,bh,2*_mm,fill=1,stroke=0)
+            c.setFillColor(BDR); c.roundRect(M,y-bh,W-2*M,bh,2*_mm,fill=0,stroke=1)
+            ty=y-6*_mm
+            for l in nlines:
+                c.setFillColor(TEXT); c.setFont("Helvetica",9.5); c.drawString(M+4*_mm,ty,l); ty-=5.5*_mm
+            y-=bh+8*_mm
+
+            # Remaining findings
+            findings=result.get("findings",[])
+            if len(findings)>6:
+                c.setFillColor(MUTED); c.setFont("Helvetica-Bold",8); c.drawString(M,y,"ADDITIONAL FINDINGS")
+                c.setFillColor(BDR); c.rect(M,y-2*_mm,W-2*M,0.3*_mm,fill=1,stroke=0); y-=7*_mm
+                for f in findings[6:]:
+                    if y<40*_mm: break
+                    fc2=_colors.HexColor("#ef4444") if f.get("flag") else _colors.HexColor("#22c55e")
+                    c.setFillColor(SURF); c.roundRect(M,y-6*_mm,W-2*M,7*_mm,1.5*_mm,fill=1,stroke=0)
+                    c.setFillColor(fc2); c.setFont("Helvetica-Bold",9); c.drawString(M+3*_mm,y-3*_mm,"▲" if f.get("flag") else "✓")
+                    c.setFillColor(TEXT); c.setFont("Helvetica-Bold",9); c.drawString(M+9*_mm,y-3*_mm,str(f.get("label","")))
+                    c.setFillColor(fc2); c.setFont("Helvetica",9); c.drawRightString(W-M-3*_mm,y-3*_mm,str(f.get("value","")))
+                    y-=8*_mm
+                y-=4*_mm
+
+            # What changed
+            if diff and len(diff)>1:
+                c.setFillColor(MUTED); c.setFont("Helvetica-Bold",8); c.drawString(M,y,"CHANGES SINCE LAST SCAN")
+                c.setFillColor(BDR); c.rect(M,y-2*_mm,W-2*M,0.3*_mm,fill=1,stroke=0); y-=7*_mm
+                for ch in diff:
+                    if y<40*_mm: break
+                    d=ch.get("direction","neutral")
+                    fc2=_colors.HexColor("#ef4444") if d=="worsened" else (_colors.HexColor("#22c55e") if d=="improved" else MUTED)
+                    icon="↑" if d=="worsened" else ("↓" if d=="improved" else "→")
+                    c.setFillColor(SURF); c.roundRect(M,y-6*_mm,W-2*M,7*_mm,1.5*_mm,fill=1,stroke=0)
+                    c.setFillColor(fc2); c.setFont("Helvetica-Bold",9); c.drawString(M+3*_mm,y-3*_mm,icon)
+                    c.setFillColor(TEXT); c.setFont("Helvetica-Bold",9); c.drawString(M+9*_mm,y-3*_mm,str(ch.get("field","")))
+                    c.setFillColor(MUTED); c.setFont("Helvetica",8)
+                    c.drawRightString(W-M-3*_mm,y-3*_mm,f"{str(ch.get('old',''))[:25]}  →  {str(ch.get('new',''))[:25]}")
+                    y-=8*_mm
+                y-=4*_mm
+
+            # Recommendation
+            if y>50*_mm:
+                recs={"RED":("RECOMMENDATION: DO NOT ENGAGE","Multiple high-risk signals detected. Do not click, pay, or share personal information with this domain."),"YELLOW":("RECOMMENDATION: PROCEED WITH CAUTION","Moderate risk indicators present. Verify independently before making any payments or sharing sensitive information."),"GREEN":("RECOMMENDATION: APPEARS SAFE TO ENGAGE","No significant risk indicators detected. Standard due diligence applies.")}
+                rt,rb=recs.get(verdict,recs["YELLOW"])
+                rblines=_wrap(rb,90); bh=len(rblines)*5*_mm+14*_mm
+                c.setFillColor(_vbg(verdict)); c.roundRect(M,y-bh,W-2*M,bh,2*_mm,fill=1,stroke=0)
+                c.setStrokeColor(v_color); c.setLineWidth(1.5); c.roundRect(M,y-bh,W-2*M,bh,2*_mm,fill=0,stroke=1); c.setLineWidth(1)
+                c.setFillColor(v_color); c.setFont("Helvetica-Bold",9); c.drawString(M+4*_mm,y-6*_mm,rt)
+                ty=y-12*_mm
+                for l in rblines:
+                    c.setFillColor(TEXT); c.setFont("Helvetica",9); c.drawString(M+4*_mm,ty,l); ty-=5*_mm
+
+        # Footer both pages
+        c.setFillColor(BG2); c.rect(0,0,W,18*_mm,fill=1,stroke=0)
+        c.setFillColor(BLUE); c.rect(0,18*_mm,W,0.3*_mm,fill=1,stroke=0)
+        c.setFillColor(FAINT); c.setFont("Helvetica",7)
+        c.drawString(M,11*_mm,"Generated by Signum AI — for informational purposes only. Not legal advice.")
+        c.drawString(M,6*_mm,"12 intelligence sources checked  ·  signumaiapp.com  ·  Prepared by Aleks Asenov, AI VA Specialist")
+        c.setFillColor(MUTED); c.drawRightString(W-M,8.5*_mm,f"Page {page_num} of 2")
+
+        if page_num == 1: c.showPage()
+
+    c.save(); buf.seek(0)
+    return buf.read()
+# ==================== END PDF GENERATOR ====================
+
+
+@app.get("/generate-report")
+async def generate_report_endpoint(
+    domain: str,
+    authorization: str = Header(None)
+):
+    """Generate PDF report for a domain from last scan result."""
+    user_id = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:]
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    f"{SUPABASE_URL}/auth/v1/user",
+                    headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {token}"},
+                    timeout=5,
+                )
+                if r.status_code == 200:
+                    user_id = r.json().get("id")
+        except Exception:
+            pass
+
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    # Check user plan - PDF report is Pro/Team only
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/profiles",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                params={"id": f"eq.{user_id}", "select": "plan"},
+                timeout=5,
+            )
+            profile = r.json()[0] if r.status_code == 200 and r.json() else {}
+            plan = profile.get("plan", "free")
+    except Exception:
+        plan = "free"
+
+    if plan not in ("pro", "team"):
+        raise HTTPException(status_code=403, detail="PDF reports require a Pro or Team plan. Upgrade at signumaiapp.com")
+
+    # Get latest scan result
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/scan_results",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                params={"user_id": f"eq.{user_id}", "domain": f"eq.{domain}", "order": "created_at.desc", "limit": "2"},
+                timeout=5,
+            )
+            rows = r.json() if r.status_code == 200 else []
+    except Exception:
+        raise HTTPException(status_code=404, detail="No scan found for this domain")
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No scan found. Please scan this domain first.")
+
+    result = rows[0].get("result_json", {})
+    result["target"] = domain
+
+    # Get diff if we have 2 scans
+    diff = None
+    if len(rows) >= 2:
+        diff = generate_scan_diff(rows[1].get("result_json", {}), result)
+
+    # Generate PDF
+    pdf_bytes = generate_pdf_report(result, diff)
+    safe_domain = domain.replace("/", "_").replace(".", "_")
+
+    return StreamingResponse(
+        _io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=signum_{safe_domain}.pdf"}
+    )
+
+
+@app.get("/report/{domain}")
+async def shareable_report(domain: str, request: Request):
+    """Shareable HTML report page for a domain - no auth required, shows latest public scan."""
+    # Get latest scan for this domain (any user - most recent)
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/scan_results",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                params={"domain": f"eq.{domain}", "order": "created_at.desc", "limit": "1"},
+                timeout=5,
+            )
+            rows = r.json() if r.status_code == 200 else []
+    except Exception:
+        raise HTTPException(status_code=404, detail="No scan found")
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No scan found for {domain}. Visit signumaiapp.com to scan it.")
+
+    result = rows[0].get("result_json", {})
+    result["target"] = domain
+    verdict = result.get("verdict", "YELLOW")
+    score = result.get("score", 0)
+    v_colors = {"GREEN": "#22c55e", "YELLOW": "#f59e0b", "RED": "#ef4444"}
+    v_color = v_colors.get(verdict, "#3b82f6")
+    verdict_labels = {"GREEN": "TRUSTED", "YELLOW": "CAUTION", "RED": "HIGH RISK"}
+    v_label = verdict_labels.get(verdict, verdict)
+    scan_date = result.get("scanned_at", rows[0].get("created_at", "")[:16].replace("T", " "))
+
+    findings_html = ""
+    for f in result.get("findings", []):
+        flag = f.get("flag", False)
+        fc = "#ef4444" if flag else "#22c55e"
+        icon = "▲" if flag else "✓"
+        findings_html += f'<div class="finding"><span class="fi-icon" style="color:{fc}">{icon}</span><span class="fi-label">{f.get("label","")}</span><span class="fi-value" style="color:{fc}">{f.get("value","")}</span></div>'
+
+    raw_html = ""
+    for k, v in result.get("raw_labels", {}).items():
+        raw_html += f'<div class="raw-row"><span class="raw-k">{k}</span><span class="raw-v">{v}</span></div>'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Signum Report — {domain}</title>
+<meta property="og:title" content="Signum Trust Report: {domain}">
+<meta property="og:description" content="Risk score: {score}/100 — {v_label}. AI-powered trust intelligence.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0a0f1e;color:#e2e8f0;font-family:"DM Sans",sans-serif;min-height:100vh}}
+.header{{background:#0f172a;border-bottom:1px solid #1e3a5f;padding:14px 20px;display:flex;align-items:center;justify-content:space-between}}
+.logo{{font-size:18px;font-weight:700;color:#3b82f6;text-decoration:none}}
+.header-link{{font-size:13px;color:#94a3b8;text-decoration:none}}
+.header-link:hover{{color:#3b82f6}}
+.page{{max-width:680px;margin:0 auto;padding:32px 20px 80px}}
+.hero-card{{background:#0f172a;border:1px solid #1e3a5f;border-radius:12px;padding:24px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:16px}}
+.domain-name{{font-size:22px;font-weight:700;color:#fff;margin-bottom:8px}}
+.verdict-badge{{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:100px;font-size:12px;font-weight:700;background:{"#14532d" if verdict=="GREEN" else "#78350f" if verdict=="YELLOW" else "#7f1d1d"};color:{v_color};border:1px solid {v_color}}}
+.score-wrap{{text-align:center;flex-shrink:0}}
+.score-num{{font-size:42px;font-weight:700;color:{v_color};line-height:1}}
+.score-lbl{{font-size:10px;color:#94a3b8;font-family:"DM Mono",monospace;margin-top:4px}}
+.section{{background:#0f172a;border:1px solid #1e3a5f;border-radius:12px;padding:20px;margin-bottom:12px}}
+.section-title{{font-size:11px;font-family:"DM Mono",monospace;font-weight:600;color:#94a3b8;letter-spacing:0.8px;text-transform:uppercase;margin-bottom:14px}}
+.summary{{font-size:16px;color:#e2e8f0;line-height:1.6}}
+.finding{{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid #1e293b}}
+.finding:last-child{{border-bottom:none}}
+.fi-icon{{font-size:13px;font-weight:700;flex-shrink:0;width:16px}}
+.fi-label{{font-size:14px;color:#94a3b8;flex:1}}
+.fi-value{{font-size:13px;font-weight:600}}
+.raw-row{{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid #111827;font-size:13px}}
+.raw-row:last-child{{border-bottom:none}}
+.raw-k{{color:#64748b;font-family:"DM Mono",monospace;font-size:11px}}
+.raw-v{{color:#94a3b8;font-weight:500}}
+.narrative{{font-size:15px;color:#cbd5e1;line-height:1.7}}
+.cta-box{{background:linear-gradient(135deg,#1e3a5f,#162032);border:1px solid #3b82f6;border-radius:12px;padding:20px;text-align:center;margin-top:24px}}
+.cta-title{{font-size:16px;font-weight:600;margin-bottom:8px}}
+.cta-sub{{font-size:13px;color:#94a3b8;margin-bottom:14px}}
+.cta-btn{{display:inline-block;background:#3b82f6;color:#fff;font-weight:600;font-size:14px;padding:10px 24px;border-radius:8px;text-decoration:none}}
+.scan-date{{font-size:12px;color:#475569;margin-top:8px}}
+</style>
+</head>
+<body>
+<div class="header">
+  <a class="logo" href="https://signumaiapp.com">SIGNUM</a>
+  <a class="header-link" href="https://signumaiapp.com">← Scan another domain</a>
+</div>
+<div class="page">
+  <div class="hero-card">
+    <div>
+      <div class="domain-name">{domain}</div>
+      <div class="verdict-badge">{v_label}</div>
+      <div class="scan-date">Scanned: {scan_date}</div>
+    </div>
+    <div class="score-wrap">
+      <div class="score-num">{score}</div>
+      <div class="score-lbl">RISK SCORE</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">AI Verdict Summary</div>
+    <div class="summary">{result.get("verdict_summary","")}</div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Key Findings</div>
+    {findings_html}
+  </div>
+
+  <div class="section">
+    <div class="section-title">Intelligence Sources</div>
+    {raw_html}
+  </div>
+
+  <div class="section">
+    <div class="section-title">Detailed Analysis</div>
+    <div class="narrative">{result.get("narrative","")}</div>
+  </div>
+
+  <div class="cta-box">
+    <div class="cta-title">Check any domain before you click, pay, or partner</div>
+    <div class="cta-sub">Free to try · No account required · Results in seconds</div>
+    <a class="cta-btn" href="https://signumaiapp.com">Scan a domain →</a>
+  </div>
+</div>
+</body>
+</html>"""
+
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=html)
 
 
 if __name__ == "__main__":
