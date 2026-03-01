@@ -1003,6 +1003,92 @@ async def save_scan_result(user_id: str, domain: str, result: dict):
         logger.warning(f"save_scan_result failed: {e}")
 
 
+def generate_scan_diff(old_result: dict, new_result: dict) -> list:
+    """Compare two scan results and return list of meaningful changes."""
+    changes = []
+    
+    # Score change
+    old_score = old_result.get("score", 0)
+    new_score = new_result.get("score", 0)
+    if old_score != new_score:
+        direction = "increased" if new_score > old_score else "decreased"
+        changes.append({
+            "field": "Risk score",
+            "old": str(old_score),
+            "new": str(new_score),
+            "direction": direction,
+            "severity": "high" if abs(new_score - old_score) >= 20 else "medium"
+        })
+    
+    # Verdict change
+    old_verdict = old_result.get("verdict", "")
+    new_verdict = new_result.get("verdict", "")
+    if old_verdict and new_verdict and old_verdict != new_verdict:
+        label = {"GREEN": "Safe", "YELLOW": "Caution", "RED": "Danger"}
+        changes.append({
+            "field": "Verdict",
+            "old": label.get(old_verdict, old_verdict),
+            "new": label.get(new_verdict, new_verdict),
+            "direction": "worsened" if new_verdict == "RED" or (new_verdict == "YELLOW" and old_verdict == "GREEN") else "improved",
+            "severity": "high"
+        })
+    
+    # Raw data changes
+    old_raw = old_result.get("raw_data") or old_result.get("raw_labels") or {}
+    new_raw = new_result.get("raw_data") or new_result.get("raw_labels") or {}
+    
+    # IPQS score
+    old_ipqs = None
+    new_ipqs = None
+    if isinstance(old_raw, dict):
+        old_ipqs = (old_raw.get("ipqs") or {}).get("fraud_score") or old_raw.get("ipqs_score")
+    if isinstance(new_raw, dict):
+        new_ipqs = (new_raw.get("ipqs") or {}).get("fraud_score") or new_raw.get("ipqs_score")
+    if old_ipqs is not None and new_ipqs is not None and old_ipqs != new_ipqs:
+        direction = "increased" if new_ipqs > old_ipqs else "decreased"
+        changes.append({
+            "field": "Threat intelligence score",
+            "old": str(old_ipqs),
+            "new": str(new_ipqs),
+            "direction": direction,
+            "severity": "high" if abs(new_ipqs - old_ipqs) >= 15 else "medium"
+        })
+    
+    # Blacklist status
+    old_bl = None
+    new_bl = None
+    if isinstance(old_raw, dict):
+        old_bl = (old_raw.get("ipqs") or {}).get("blacklisted") or old_raw.get("blacklisted")
+    if isinstance(new_raw, dict):
+        new_bl = (new_raw.get("ipqs") or {}).get("blacklisted") or new_raw.get("blacklisted")
+    if old_bl is not None and new_bl is not None and old_bl != new_bl:
+        changes.append({
+            "field": "Blacklist status",
+            "old": "Blacklisted" if old_bl else "Clean",
+            "new": "Blacklisted" if new_bl else "Clean",
+            "direction": "worsened" if new_bl else "improved",
+            "severity": "high"
+        })
+    
+    # SSL status
+    old_ssl = None
+    new_ssl = None
+    if isinstance(old_raw, dict):
+        old_ssl = (old_raw.get("ssl") or {}).get("valid") or old_raw.get("ssl_valid")
+    if isinstance(new_raw, dict):
+        new_ssl = (new_raw.get("ssl") or {}).get("valid") or new_raw.get("ssl_valid")
+    if old_ssl is not None and new_ssl is not None and old_ssl != new_ssl:
+        changes.append({
+            "field": "SSL certificate",
+            "old": "Valid" if old_ssl else "Invalid",
+            "new": "Valid" if new_ssl else "Invalid",
+            "direction": "improved" if new_ssl else "worsened",
+            "severity": "medium"
+        })
+    
+    return changes
+
+
 async def update_watchlist_scores(domain: str, score: int, verdict: str):
     """Update watchlist scores and send alert emails if verdict changed."""
     if not SUPABASE_URL:
@@ -1039,9 +1125,21 @@ async def update_watchlist_scores(domain: str, score: int, verdict: str):
                 old_verdict = entry.get("last_verdict")
                 old_score = entry.get("last_score") or 0
                 if old_verdict and old_verdict != verdict:
-                    # Verdict changed — fetch user email and send alert
                     user_id = entry.get("user_id")
                     if user_id:
+                        # Fetch previous scan result for diff
+                        prev_result = {}
+                        try:
+                            pr = await client.get(
+                                f"{SUPABASE_URL}/rest/v1/scan_results?user_id=eq.{user_id}&domain=eq.{domain}&order=created_at.desc&limit=1",
+                                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                                timeout=5,
+                            )
+                            if pr.status_code == 200 and pr.json():
+                                prev_result = pr.json()[0].get("result_json", {})
+                        except Exception:
+                            pass
+
                         ur = await client.get(
                             f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
                             headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
@@ -1051,7 +1149,8 @@ async def update_watchlist_scores(domain: str, score: int, verdict: str):
                             user_email = ur.json().get("email", "")
                             if user_email:
                                 asyncio.create_task(send_watchlist_alert_email(
-                                    user_email, domain, old_score, score, old_verdict, verdict
+                                    user_email, domain, old_score, score, old_verdict, verdict,
+                                    diff=generate_scan_diff(prev_result, {"score": score, "verdict": verdict})
                                 ))
                                 logger.info(f"Watchlist alert sent: {domain} {old_verdict}→{verdict} to {user_email}")
 
@@ -1285,6 +1384,32 @@ async def investigate(req: InvestigateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/scan-diff")
+async def get_scan_diff(domain: str, authorization: str = Header(None)):
+    """Get diff between last two scan results for a domain."""
+    token = authorization.replace("Bearer ", "") if authorization else ""
+    user = await get_user_from_token(token) if token else None
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        clean = domain.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0].split("?")[0]
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/scan_results?user_id=eq.{user['id']}&domain=eq.{clean}&order=created_at.desc&limit=2",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                timeout=5,
+            )
+            data = r.json()
+            if data and len(data) >= 2:
+                new_result = data[0]["result_json"]
+                old_result = data[1]["result_json"]
+                diff = generate_scan_diff(old_result, new_result)
+                return {"diff": diff, "has_changes": len(diff) > 0}
+            return {"diff": [], "has_changes": False}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/scan-result")
 async def get_scan_result(domain: str, authorization: str = Header(None)):
     """Get the last full scan result for a domain."""
@@ -1432,6 +1557,27 @@ async def send_welcome_email(to: str):
     await send_email(to, "You're in. Here's what Signum does.", html)
 
 async def send_first_scan_email(to: str, domain: str):
+    diff_html = ""
+    if diff:
+        rows = ""
+        for ch in diff[:5]:
+            direction_color = "#ef4444" if ch.get("direction") in ("worsened", "increased") else "#22c55e"
+            rows += f'''<tr>
+              <td style="padding:8px 12px;color:#7a8aaa;font-size:13px;border-bottom:1px solid #1e2d4a;">{ch["field"]}</td>
+              <td style="padding:8px 12px;font-family:monospace;font-size:13px;color:#7a8aaa;border-bottom:1px solid #1e2d4a;">{ch["old"]}</td>
+              <td style="padding:8px 12px;font-size:13px;color:{direction_color};font-weight:600;border-bottom:1px solid #1e2d4a;">{ch["new"]}</td>
+            </tr>'''
+        diff_html = f'''<div style="margin-bottom:24px;">
+          <div style="font-size:11px;font-family:monospace;font-weight:700;letter-spacing:0.8px;color:#3d4f6e;margin-bottom:10px;">WHAT CHANGED</div>
+          <table style="width:100%;border-collapse:collapse;background:#0d1525;border:1px solid #1e2d4a;border-radius:8px;overflow:hidden;">
+            <thead><tr>
+              <th style="padding:8px 12px;text-align:left;font-size:11px;color:#3d4f6e;font-weight:600;border-bottom:1px solid #1e2d4a;">SIGNAL</th>
+              <th style="padding:8px 12px;text-align:left;font-size:11px;color:#3d4f6e;font-weight:600;border-bottom:1px solid #1e2d4a;">BEFORE</th>
+              <th style="padding:8px 12px;text-align:left;font-size:11px;color:#3d4f6e;font-weight:600;border-bottom:1px solid #1e2d4a;">NOW</th>
+            </tr></thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </div>'''
     html = signum_email_base(f"""
       <h1 style="font-size:22px;font-weight:700;margin:0 0 12px;letter-spacing:-0.5px;">You just ran your first scan.<br/>Here's what you didn't see.</h1>
       <p style="font-size:15px;line-height:1.7;color:#7a8aaa;margin:0 0 8px;">You scanned <strong style="color:#e8edf5;">{domain}</strong>. Good instinct.</p>
@@ -1451,7 +1597,7 @@ async def send_upgrade_nudge_email(to: str):
     """)
     await send_email(to, "You've scanned 3 domains. You're only seeing half the picture.", html)
 
-async def send_watchlist_alert_email(to: str, domain: str, old_score: int, new_score: int, old_verdict: str, new_verdict: str):
+async def send_watchlist_alert_email(to: str, domain: str, old_score: int, new_score: int, old_verdict: str, new_verdict: str, diff: list = None):
     verdict_colors = {"GREEN": "#22c55e", "YELLOW": "#eab308", "RED": "#ef4444"}
     old_c = verdict_colors.get(old_verdict, "#7a8aaa")
     new_c = verdict_colors.get(new_verdict, "#7a8aaa")
@@ -1466,6 +1612,7 @@ async def send_watchlist_alert_email(to: str, domain: str, old_score: int, new_s
           <span style="color:{new_c};font-weight:700;">{new_score} {new_verdict}</span>
         </div>
       </div>
+      {diff_html}
       <p style="font-size:15px;line-height:1.7;color:#7a8aaa;margin:0 0 28px;">Score changes mean something changed on their end. It could be nothing. It probably isn't.<br/><strong style="color:#e8edf5;">Don't find out the hard way.</strong></p>
       <a href="{scan_url}" style="display:inline-block;background:#3b82f6;color:#fff;font-weight:600;font-size:14px;padding:12px 24px;border-radius:8px;text-decoration:none;letter-spacing:-0.2px;">See what's happening →</a>
     """)
