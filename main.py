@@ -26,7 +26,7 @@ import re
 import socket
 import ssl
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from dotenv import load_dotenv
@@ -2208,7 +2208,15 @@ def generate_pdf_report(result: dict, diff: list = None) -> bytes:
         c.setFillColor(BG); c.rect(0,0,W,H,fill=1,stroke=0)
         verdict=result.get("verdict","YELLOW"); score=result.get("score",0)
         v_color=_vc(verdict); domain=result.get("target","unknown")
-        scan_date=result.get("scanned_at",datetime.now(timezone.utc).strftime("%d %b %Y %H:%M"))
+        # Format scan date with user timezone
+        _raw_date = result.get("scanned_at","")
+        try:
+            from datetime import timedelta as _td
+            _utc_dt = datetime.strptime(_raw_date, "%d %b %H:%M").replace(year=datetime.now().year, tzinfo=timezone.utc)
+            _local_dt = _utc_dt + _td(minutes=tz_offset)
+            scan_date = _local_dt.strftime("%d %b %H:%M")
+        except:
+            scan_date = _raw_date
 
         # Header
         c.setFillColor(BG2); c.rect(0,H-62*_mm,W,62*_mm,fill=1,stroke=0)
@@ -2377,6 +2385,7 @@ def generate_pdf_report(result: dict, diff: list = None) -> bytes:
 @app.get("/generate-report")
 async def generate_report_endpoint(
     domain: str,
+    tz_offset: int = 0,
     authorization: str = Header(None)
 ):
     """Generate PDF report for a domain from last scan result."""
@@ -2440,7 +2449,7 @@ async def generate_report_endpoint(
         diff = generate_scan_diff(rows[1].get("result_json", {}), result)
 
     # Generate PDF
-    pdf_bytes = generate_pdf_report(result, diff)
+    pdf_bytes = generate_pdf_report(result, diff, tz_offset=tz_offset)
     safe_domain = domain.replace("/", "_").replace(".", "_")
 
     return StreamingResponse(
