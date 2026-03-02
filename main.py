@@ -2444,7 +2444,7 @@ async def generate_report_endpoint(
     safe_domain = domain.replace("/", "_").replace(".", "_")
 
     return StreamingResponse(
-        _io.BytesIO(pdf_bytes),
+        io.BytesIO(pdf_bytes),
         media_type="application/pdf",
         headers={"Content-Disposition": f"attachment; filename=signum_{safe_domain}.pdf"}
     )
