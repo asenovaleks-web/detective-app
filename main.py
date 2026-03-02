@@ -2195,7 +2195,7 @@ def _fc(val):
     if any(x in v for x in ["caution","moderate","unknown","no history","not listed"]): return _colors.HexColor("#f59e0b")
     return _colors.HexColor("#22c55e")
 
-def generate_pdf_report(result: dict, diff: list = None) -> bytes:
+def generate_pdf_report(result: dict, diff: list = None, tz_offset: int = 0) -> bytes:
     BG=_colors.HexColor("#0a0f1e"); BG2=_colors.HexColor("#0f172a"); SURF=_colors.HexColor("#1e293b")
     SURF2=_colors.HexColor("#162032"); BDR=_colors.HexColor("#1e3a5f"); BLUE=_colors.HexColor("#3b82f6")
     TEXT=_colors.HexColor("#e2e8f0"); MUTED=_colors.HexColor("#94a3b8"); FAINT=_colors.HexColor("#475569")
