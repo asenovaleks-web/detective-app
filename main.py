@@ -2505,10 +2505,12 @@ async def shareable_report(domain: str, request: Request):
 
     findings_html = ""
     for f in result.get("findings", []):
-        flag = f.get("flag", False)
-        fc = "#ef4444" if flag else "#22c55e"
-        icon = "▲" if flag else "✓"
-        findings_html += f'<div class="finding"><span class="fi-icon" style="color:{fc}">{icon}</span><span class="fi-label">{f.get("label","")}</span><span class="fi-value" style="color:{fc}">{f.get("value","")}</span></div>'
+        tag = f.get("tag", "OK")
+        is_risk = tag in ("RISK", "CAUTION")
+        fc = "#ef4444" if tag == "RISK" else "#f59e0b" if tag == "CAUTION" else "#22c55e"
+        icon = f.get("icon", "▲" if is_risk else "✓")
+        text = f.get("text", f.get("label", ""))
+        findings_html += f'<div class="finding"><span class="fi-icon" style="color:{fc}">{icon}</span><span class="fi-label" style="color:{fc};font-size:13px;line-height:1.5;">{text}</span></div>'
 
     raw_html = ""
     for k, v in result.get("raw_labels", {}).items():
