@@ -19,6 +19,7 @@ Environment variables required: see Railway dashboard
 """
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -2183,7 +2184,6 @@ signumaiapp.com"""
         logger.error(f"deliver_paid_scan failed: {e}")
 
 # ==================== PDF REPORT GENERATOR ====================
-import io
 from reportlab.lib.pagesizes import A4 as _A4
 from reportlab.lib import colors as _colors
 from reportlab.lib.units import mm as _mm
