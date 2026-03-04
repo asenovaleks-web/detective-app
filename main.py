@@ -1361,18 +1361,25 @@ async def investigate(req: InvestigateRequest):
                 check_abuseipdb(domain, client),          # 9
                 check_otx(domain, client),                # 10
                 check_dns_intel(domain, client),          # 11
+                check_companies_house(domain, client),    # 12
+                check_sec_edgar(domain, client),          # 13
+                check_gleif(domain, client),              # 14
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
         (whois_data, vt_data, gsb_data, ssl_data, urlscan_data,
          trustpilot_data, wayback_data, shodan_data,
-         ipqs_data, abuseipdb_data, otx_data, dns_data) = results
+         ipqs_data, abuseipdb_data, otx_data, dns_data,
+         companies_house_data, sec_edgar_data, gleif_data) = results
 
         logger.info(f"Data collected. WHOIS: {whois_data}, VT: {vt_data}, GSB: {gsb_data}")
 
         all_intelligence = {
             "target": domain,
             "whois": whois_data,
+            "companies_house": companies_house_data,
+            "sec_edgar": sec_edgar_data,
+            "gleif": gleif_data,
             "virustotal": vt_data,
             "google_safe_browsing": gsb_data,
             "ssl": ssl_data,
@@ -2690,6 +2697,126 @@ async def trending_threats():
     except Exception as e:
         logger.error(f"trending_threats error: {e}")
         return {"threats": []}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WEEKLY THREAT DIGEST
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def send_weekly_digest():
+    """Send weekly threat digest to all Pro/Team users with watchlist domains."""
+    if not SUPABASE_URL or not RESEND_API_KEY:
+        return
+    try:
+        # Get all users with watchlist entries
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/watchlist?select=user_id,domain,last_score,last_verdict",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                timeout=10,
+            )
+            entries = r.json() if r.status_code == 200 else []
+
+        if not entries:
+            logger.info("Weekly digest: no watchlist entries found")
+            return
+
+        # Group by user
+        from collections import defaultdict
+        user_domains = defaultdict(list)
+        for e in entries:
+            user_domains[e["user_id"]].append(e)
+
+        for user_id, domains in user_domains.items():
+            # Get user email and plan
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=plan",
+                    headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                    timeout=5,
+                )
+                profile = r.json()[0] if r.status_code == 200 and r.json() else {}
+                if profile.get("plan", "free") not in ("pro", "team"):
+                    continue
+
+                r2 = await client.get(
+                    f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                    headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                    timeout=5,
+                )
+                user_email = r2.json().get("email", "") if r2.status_code == 200 else ""
+
+            if not user_email:
+                continue
+
+            # Build digest rows
+            rows_html = ""
+            risk_count = 0
+            for d in domains:
+                verdict = d.get("last_verdict", "YELLOW")
+                score = d.get("last_score", 0)
+                color = "#ef4444" if verdict == "RED" else "#f59e0b" if verdict == "YELLOW" else "#22c55e"
+                label = "HIGH RISK" if verdict == "RED" else "CAUTION" if verdict == "YELLOW" else "TRUSTED"
+                if verdict in ("RED", "YELLOW"):
+                    risk_count += 1
+                rows_html += f"""
+                <tr>
+                  <td style="padding:10px 0;border-bottom:1px solid #1e293b;font-family:monospace;color:#3b82f6;">{d['domain']}</td>
+                  <td style="padding:10px 0;border-bottom:1px solid #1e293b;text-align:center;font-weight:700;color:{color};">{score}/100</td>
+                  <td style="padding:10px 0;border-bottom:1px solid #1e293b;text-align:right;font-weight:600;color:{color};">{label}</td>
+                </tr>"""
+
+            subject = f"⚠ {risk_count} domain(s) need attention — Signum Weekly Digest" if risk_count else "✅ All clear — Signum Weekly Digest"
+
+            html = f"""
+            <div style="font-family:'DM Sans',sans-serif;max-width:540px;margin:0 auto;background:#0b0f1a;color:#e8edf5;padding:32px;border-radius:12px;">
+              <div style="font-size:20px;font-weight:700;color:#3b82f6;margin-bottom:4px;">SIGNUM</div>
+              <div style="font-size:12px;color:#475569;font-family:monospace;margin-bottom:28px;">WEEKLY THREAT DIGEST</div>
+              <h2 style="font-size:18px;font-weight:700;margin-bottom:8px;">Your {len(domains)} monitored domain(s)</h2>
+              <p style="color:#7a8aaa;font-size:14px;margin-bottom:20px;">Here's the latest intelligence on your watchlist. {f'{risk_count} domain(s) flagged for attention.' if risk_count else 'Everything looks clean this week.'}</p>
+              <table style="width:100%;border-collapse:collapse;">
+                <tr>
+                  <th style="text-align:left;font-size:11px;color:#475569;font-family:monospace;padding-bottom:8px;">DOMAIN</th>
+                  <th style="text-align:center;font-size:11px;color:#475569;font-family:monospace;padding-bottom:8px;">SCORE</th>
+                  <th style="text-align:right;font-size:11px;color:#475569;font-family:monospace;padding-bottom:8px;">STATUS</th>
+                </tr>
+                {rows_html}
+              </table>
+              <div style="margin-top:24px;text-align:center;">
+                <a href="https://signumaiapp.com" style="display:inline-block;background:#3b82f6;color:#fff;font-weight:600;font-size:14px;padding:12px 24px;border-radius:8px;text-decoration:none;">View Dashboard →</a>
+              </div>
+              <p style="margin-top:24px;font-size:12px;color:#475569;text-align:center;">Signum AI · signumaiapp.com · <a href="https://signumaiapp.com" style="color:#475569;">Unsubscribe</a></p>
+            </div>"""
+
+            await send_email(user_email, subject, html)
+            logger.info(f"Weekly digest sent to {user_email} ({len(domains)} domains)")
+
+    except Exception as e:
+        logger.error(f"Weekly digest failed: {e}")
+
+
+async def weekly_digest_scheduler():
+    """Run weekly digest every 7 days."""
+    await asyncio.sleep(10)  # Wait for app startup
+    while True:
+        now = datetime.now(timezone.utc)
+        # Run every Monday at 08:00 UTC
+        days_until_monday = (7 - now.weekday()) % 7 or 7
+        seconds_until = days_until_monday * 86400 - now.hour * 3600 - now.minute * 60 - now.second
+        logger.info(f"Weekly digest scheduled in {seconds_until//3600}h")
+        await asyncio.sleep(seconds_until)
+        await send_weekly_digest()
+
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app):
+    asyncio.create_task(weekly_digest_scheduler())
+    logger.info("Weekly digest scheduler started")
+    yield
+
+app.router.lifespan_context = lifespan
 
 
 if __name__ == "__main__":
