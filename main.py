@@ -55,6 +55,29 @@ app.add_middleware(
 async def options_investigate():
     return {"status": "ok"}
 
+@app.options("/generate-report")
+async def options_generate_report():
+    return {"status": "ok"}
+
+from fastapi.responses import JSONResponse as _JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class CORSErrorMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        try:
+            response = await call_next(request)
+        except Exception as e:
+            response = _JSONResponse(
+                status_code=500,
+                content={"detail": str(e)},
+            )
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
+
+app.add_middleware(CORSErrorMiddleware)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 # Load all config from environment
 _env = os.environ
@@ -2464,7 +2487,11 @@ async def generate_report_endpoint(
         diff = generate_scan_diff(rows[1].get("result_json", {}), result)
 
     # Generate PDF
-    pdf_bytes = generate_pdf_report(result, diff, tz_offset=tz_offset)
+    try:
+        pdf_bytes = generate_pdf_report(result, diff, tz_offset=tz_offset)
+    except Exception as e:
+        logger.error(f"PDF generation failed for {domain}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
     safe_domain = domain.replace("/", "_").replace(".", "_")
 
     return StreamingResponse(
