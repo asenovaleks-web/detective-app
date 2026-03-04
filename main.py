@@ -873,8 +873,8 @@ IMPORTANT DISTINCTIONS:
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
-            json={"model": "claude-sonnet-4-6", "max_tokens": 2000, "messages": [{"role": "user", "content": prompt}]},
-            timeout=45,
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 1200, "messages": [{"role": "user", "content": prompt}]},
+            timeout=30,
         )
     response_json = r.json()
     if "error" in response_json:
@@ -2117,8 +2117,23 @@ async def deliver_paid_scan(domain: str, email: str):
                     scan_result["target"] = domain
 
         if not scan_result:
-            logger.warning(f"No scan result for {domain}, cannot deliver paid report")
-            return
+            logger.info(f"No cached scan for {domain} — running fresh scan for paid delivery")
+            try:
+                req_obj = InvestigateRequest(target=domain, user_token=None)
+                inv_result = await investigate(req_obj)
+                scan_result = {
+                    "target": domain,
+                    "score": inv_result.score,
+                    "verdict": inv_result.verdict,
+                    "verdict_summary": inv_result.verdict_summary,
+                    "findings": inv_result.findings,
+                    "narrative": inv_result.narrative,
+                    "raw_labels": inv_result.raw_labels,
+                    "scanned_at": datetime.now(timezone.utc).strftime("%d %b %H:%M"),
+                }
+            except Exception as e:
+                logger.error(f"Auto-scan failed for {domain}: {e}")
+                return
 
         # Generate PDF
         pdf_bytes = generate_pdf_report(scan_result)
@@ -2195,7 +2210,7 @@ def _fc(val):
     if any(x in v for x in ["caution","moderate","unknown","no history","not listed"]): return _colors.HexColor("#f59e0b")
     return _colors.HexColor("#22c55e")
 
-def generate_pdf_report(result: dict, diff: list = None, tz_offset: int = 0) -> bytes:
+def generate_pdf_report(result: dict, diff: list = None) -> bytes:
     BG=_colors.HexColor("#0a0f1e"); BG2=_colors.HexColor("#0f172a"); SURF=_colors.HexColor("#1e293b")
     SURF2=_colors.HexColor("#162032"); BDR=_colors.HexColor("#1e3a5f"); BLUE=_colors.HexColor("#3b82f6")
     TEXT=_colors.HexColor("#e2e8f0"); MUTED=_colors.HexColor("#94a3b8"); FAINT=_colors.HexColor("#475569")
