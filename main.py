@@ -92,6 +92,7 @@ SUPABASE_ANON     = _env.get("SUPABASE_ANON_KEY", "")
 STRIPE_SECRET     = _env.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK    = _env.get("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_ID       = _env.get("STRIPE_PRICE_ID", "price_1T3cu8ACEfVvmWmy3Q6tZGFh")
+STRIPE_TEAM_PRICE_ID  = _env.get("STRIPE_TEAM_PRICE_ID", "")
 STRIPE_ONETIMESCAN_ID = _env.get("STRIPE_ONETIMESCAN_ID", "")  # One-time €4.99 scan report
 FRONTEND_URL      = _env.get("FRONTEND_URL", "https://signumaiapp.com")
 IPQS_KEY          = _env.get("IPQS_KEY", "")
@@ -2010,7 +2011,7 @@ async def create_checkout_session(req: CheckoutRequest):
             auth=(STRIPE_SECRET, ""),
             data={
                 "mode": "subscription",
-                "line_items[0][price]": STRIPE_PRICE_ID,
+                "line_items[0][price]": STRIPE_TEAM_PRICE_ID if req.plan == "team" and STRIPE_TEAM_PRICE_ID else STRIPE_PRICE_ID,
                 "line_items[0][quantity]": "1",
                 "customer_email": req.user_email,
                 "success_url": f"{FRONTEND_URL}?upgrade=success",
