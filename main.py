@@ -1978,9 +1978,9 @@ def build_seo_page(domain: str, result: dict) -> str:
 </html>'''
 
 
-@app.get("/is-{domain}-safe", response_class=HTMLResponse)
-async def seo_domain_page(domain: str):
-    """SEO landing page for domain trust queries."""
+@app.get("/is-{domain}-safe")
+async def seo_domain_page(domain: str, request: Request):
+    """SEO landing page for domain trust queries. Returns JSON if Accept: application/json."""
     domain = clean_domain(domain)
     if not domain or len(domain) < 4 or "." not in domain:
         return HTMLResponse("<h1>Invalid domain</h1>", status_code=400)
@@ -1992,6 +1992,12 @@ async def seo_domain_page(domain: str):
         # Save to scan_results for future cache hits
         if result and result.get("score") is not None:
             asyncio.create_task(save_seo_scan_result(domain, result))
+
+    # Return JSON if client requests it (e.g. quickScan from frontend)
+    accept = request.headers.get("accept", "")
+    if "application/json" in accept:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(content=result or {}, headers={"Cache-Control": "public, max-age=3600"})
 
     html_page = build_seo_page(domain, result)
     return HTMLResponse(
@@ -3094,6 +3100,39 @@ body{{background:#0a0f1e;color:#e2e8f0;font-family:"DM Sans",sans-serif;min-heig
 
     from fastapi.responses import HTMLResponse
     return HTMLResponse(content=html)
+
+
+@app.post("/contact")
+async def contact_form(request: Request):
+    """Handle contact form submissions — forward to email."""
+    try:
+        body = await request.json()
+        email = body.get("email", "").strip()
+        subject = body.get("subject", "other")
+        message = body.get("message", "").strip()
+        if not email or not message:
+            raise HTTPException(status_code=400, detail="Missing fields")
+        if not RESEND_KEY:
+            raise HTTPException(status_code=503, detail="Email not configured")
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
+                json={
+                    "from": "Signum Contact <noreply@signumaiapp.com>",
+                    "to": ["hello@signumaiapp.com"],
+                    "reply_to": email,
+                    "subject": f"[Signum Contact] {subject} — {email}",
+                    "text": f"From: {email}\nTopic: {subject}\n\n{message}"
+                },
+                timeout=10,
+            )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"contact_form error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send")
 
 
 @app.get("/recent-activity")
