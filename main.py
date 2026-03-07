@@ -268,14 +268,28 @@ async def check_whoisxml(domain: str, client: httpx.AsyncClient) -> dict:
         return {"error": str(e)}
 
 
+_vt_quota_exceeded_until: Optional[datetime] = None
+
 async def check_virustotal(domain: str, client: httpx.AsyncClient) -> dict:
+    global _vt_quota_exceeded_until
     if not VIRUSTOTAL_KEY:
         return {"error": "No VirusTotal API key configured"}
+    if _vt_quota_exceeded_until and datetime.now(timezone.utc) < _vt_quota_exceeded_until:
+        logger.info(f"VirusTotal quota exceeded — skipping {domain}")
+        return {"skipped": True, "reason": "daily_quota_exceeded"}
     try:
         r = await client.get(
             f"https://www.virustotal.com/api/v3/domains/{domain}",
             headers={"x-apikey": VIRUSTOTAL_KEY}, timeout=15,
         )
+        if r.status_code == 429:
+            now = datetime.now(timezone.utc)
+            midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            _vt_quota_exceeded_until = midnight
+            logger.warning(f"VirusTotal 429 — quota exceeded, pausing until {midnight.isoformat()}")
+            return {"skipped": True, "reason": "daily_quota_exceeded"}
+        if r.status_code == 404:
+            return {"malicious": 0, "suspicious": 0, "harmless": 0, "engines_total": 0, "not_found": True}
         stats = r.json().get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
         return {
             "malicious": stats.get("malicious", 0),
@@ -900,6 +914,7 @@ Only mention regional registries in findings if they return something meaningful
 IMPORTANT DISTINCTIONS:
 - "Unknown domain age" means insufficient data — NOT a risk signal on its own.
 - A domain not found in VirusTotal (404) means it has no history there — treat as NEUTRAL, not suspicious.
+- If VirusTotal data shows {"skipped": true, "reason": "daily_quota_exceeded"} — the API quota is exhausted for today. Ignore this source entirely and base the verdict on the remaining sources.
 - New domains (< 6 months) are worth noting as CAUTION but not automatically dangerous.
 - Base score provided: {base_score}/100. Use this as your anchor and adjust based on qualitative signals.
 - Data confidence level: {data_confidence}. Reflect this in your verdict_summary if confidence is low.
