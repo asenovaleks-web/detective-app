@@ -3096,6 +3096,44 @@ body{{background:#0a0f1e;color:#e2e8f0;font-family:"DM Sans",sans-serif;min-heig
     return HTMLResponse(content=html)
 
 
+@app.get("/recent-activity")
+async def recent_activity():
+    """Return the 8 most recently scanned domains for homepage activity feed."""
+    if not SUPABASE_URL:
+        return {"items": []}
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/scan_results",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                params={
+                    "select": "domain,result_json,created_at",
+                    "order": "created_at.desc",
+                    "limit": "50"
+                },
+                timeout=8,
+            )
+            rows = r.json() if r.status_code == 200 else []
+
+        # Deduplicate — keep most recent per domain
+        seen = {}
+        for row in rows:
+            d = row.get("domain", "")
+            if not d or d in seen:
+                continue
+            rj = row.get("result_json", {}) or {}
+            score = rj.get("score", 0)
+            verdict = rj.get("verdict", "GREEN")
+            seen[d] = {"domain": d, "score": score, "verdict": verdict}
+            if len(seen) >= 8:
+                break
+
+        return {"items": list(seen.values())}
+    except Exception as e:
+        logger.error(f"recent_activity error: {e}")
+        return {"items": []}
+
+
 @app.get("/trending-threats")
 async def trending_threats():
     """Top high-risk domains scanned by users in the last 7 days."""
