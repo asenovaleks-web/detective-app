@@ -48,6 +48,12 @@ logger = logging.getLogger(__name__)
 _seo_mem_cache: dict = {}
 SEO_MEM_CACHE_TTL = 3600  # 1 hour
 
+# Rate limiting for /report-site: user_id -> list of timestamps
+_report_rate_limit: dict = {}
+REPORT_RATE_LIMIT = 3       # max reports
+REPORT_RATE_WINDOW = 3600   # per hour (seconds)
+
+
 
 app = FastAPI(title="The Digital Detective API", version="3.0.0")
 
@@ -1706,6 +1712,37 @@ async def investigate(req: InvestigateRequest, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+SEO_WARMUP_DOMAINS = ['amazon.com', 'ebay.com', 'temu.com', 'shein.com', 'aliexpress.com', 'binance.com', 'coinbase.com', 'kraken.com', 'bybit.com', 'kucoin.com', 'paypal.com', 'wise.com', 'revolut.com', 'stripe.com', 'cashapp.com', 'fiverr.com', 'upwork.com', 'freelancer.com', 'toptal.com', 'guru.com', 'airbnb.com', 'booking.com', 'expedia.com', 'tripadvisor.com', 'vrbo.com', 'etsy.com', 'wish.com', 'banggood.com', 'dhgate.com', 'robinhood.com', 'webull.com', 'tradingview.com', 'plus500.com', 'instagram.com', 'facebook.com', 'twitter.com', 'tiktok.com', 'youtube.com', 'realmarketgrowth.com', 'capvisiongroup.com']
+
+@app.on_event("startup")
+async def warmup_seo_cache():
+    """Pre-warm SEO cache from Supabase on startup."""
+    if not SUPABASE_URL:
+        return
+    import asyncio
+    logger.info("Warming up SEO cache...")
+    warmed = 0
+    import time
+    async with httpx.AsyncClient() as client:
+        for domain in SEO_WARMUP_DOMAINS:
+            try:
+                r = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/scan_results?domain=eq.{domain}&order=created_at.desc&limit=1",
+                    headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                    timeout=3,
+                )
+                if r.status_code == 200 and r.json():
+                    result = r.json()[0].get("result_json", {})
+                    if result and result.get("score") is not None:
+                        _seo_mem_cache[domain] = (result, time.time())
+                        warmed += 1
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+    logger.info(f"SEO cache warmed: {warmed}/{len(SEO_WARMUP_DOMAINS)} domains")
+
+
 @app.get("/scan-diff")
 async def get_scan_diff(domain: str, authorization: str = Header(None)):
     """Get diff between last two scan results for a domain."""
@@ -2137,6 +2174,23 @@ async def report_site(req: SiteReportRequest, authorization: str = Header(None))
     user = await get_user_from_token(token) if token else None
     if not user:
         raise HTTPException(status_code=401, detail="Sign in to submit reports")
+
+    # Rate limiting: max 3 reports per hour per user
+    import time as _time
+    user_id = user.get("id", "")
+    now = _time.time()
+    timestamps = _report_rate_limit.get(user_id, [])
+    # Keep only timestamps within window
+    timestamps = [t for t in timestamps if now - t < REPORT_RATE_WINDOW]
+    if len(timestamps) >= REPORT_RATE_LIMIT:
+        wait_secs = int(REPORT_RATE_WINDOW - (now - timestamps[0]))
+        wait_mins = max(1, wait_secs // 60)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many reports. Please wait {wait_mins} minute(s) before submitting again."
+        )
+    timestamps.append(now)
+    _report_rate_limit[user_id] = timestamps
 
     category_labels = {
         "fake_shop": "🛒 Fake Shop",
