@@ -1910,7 +1910,7 @@ def build_seo_page(domain: str, result: dict) -> str:
   <meta name="description" content="{description}"/>
   <meta property="og:title" content="{emoji} Is {domain} safe? Score: {score}/100"/>
   <meta property="og:description" content="{description}"/>
-  <meta property="og:url" content="https://detective-app-production-7080.up.railway.app/is-{domain}-safe"/>
+  <meta property="og:url" content="https://signumaiapp.com/is-{domain}-safe"/>
   <meta name="twitter:card" content="summary"/>
   <link rel="canonical" href="https://signumaiapp.com/?domain={domain}"/>
   <style>
@@ -2017,7 +2017,7 @@ async def sitemap_domains():
         "robinhood.com","webull.com","tradingview.com","plus500.com","ig.com",
         "instagram.com","facebook.com","twitter.com","tiktok.com","youtube.com",
     ]
-    base = "https://detective-app-production-7080.up.railway.app"
+    base = "https://signumaiapp.com"
     urls = "\n".join([
         f"  <url><loc>{base}/is-{d}-safe</loc><changefreq>weekly</changefreq><priority>0.7</priority></url>"
         for d in domains
