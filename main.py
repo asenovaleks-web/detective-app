@@ -19,6 +19,8 @@ Environment variables required: see Railway dashboard
 """
 
 import asyncio
+import re as _re
+import xml.etree.ElementTree as _ET
 import io
 import json
 import logging
@@ -2700,6 +2702,21 @@ async def trending_threats():
         return {"threats": []}
 
 
+@app.get("/scam-alerts")
+async def get_scam_alerts(limit: int = 10):
+    """Return latest scam alerts from RSS auto-scanner."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/scam_alerts?select=domain,headline,risk_score,verdict,source_url,created_at&order=created_at.desc&limit={limit}",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+            )
+            return {"alerts": r.json()}
+    except Exception as e:
+        logger.error(f"scam_alerts error: {e}")
+        return {"alerts": []}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # WEEKLY THREAT DIGEST
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2811,10 +2828,124 @@ async def weekly_digest_scheduler():
 
 from contextlib import asynccontextmanager
 
-@asynccontextmanager
+RSS_SOURCES = [
+    "https://www.reddit.com/r/Scams/new/.rss",
+    "https://www.reddit.com/r/scams/new/.rss",
+]
+
+def extract_domains_from_text(text: str) -> list:
+    pattern = r'\b(?:https?://)?([a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.(?:com|net|org|io|shop|store|online|site|xyz|co\.uk|co|info|biz))\b'
+    found = _re.findall(pattern, text or "")
+    cleaned = []
+    for d in found:
+        d = d.lower().strip(".")
+        if len(d) > 4 and "reddit" not in d and "imgur" not in d and "google" not in d:
+            cleaned.append(d)
+    return list(set(cleaned))
+
+async def fetch_rss_domains() -> list:
+    results = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        for url in RSS_SOURCES:
+            try:
+                r = await client.get(url, headers={"User-Agent": "Signum/1.0"})
+                if r.status_code != 200:
+                    continue
+                root = _ET.fromstring(r.text)
+                ns = {"atom": "http://www.w3.org/2005/Atom"}
+                entries = root.findall(".//atom:entry", ns) or root.findall(".//item")
+                for entry in entries[:10]:
+                    title = ""
+                    content = ""
+                    source_url = ""
+                    if entry.tag.endswith("entry"):
+                        title_el = entry.find("atom:title", ns)
+                        content_el = entry.find("atom:content", ns) or entry.find("atom:summary", ns)
+                        link_el = entry.find("atom:link", ns)
+                        title = title_el.text if title_el is not None else ""
+                        content = content_el.text if content_el is not None else ""
+                        source_url = link_el.get("href", "") if link_el is not None else ""
+                    else:
+                        title_el = entry.find("title")
+                        content_el = entry.find("description")
+                        link_el = entry.find("link")
+                        title = title_el.text if title_el is not None else ""
+                        content = content_el.text if content_el is not None else ""
+                        source_url = link_el.text if link_el is not None else ""
+                    combined = f"{title} {content}"
+                    domains = extract_domains_from_text(combined)
+                    for domain in domains:
+                        results.append({
+                            "domain": domain,
+                            "headline": title[:200] if title else "",
+                            "source": url,
+                            "source_url": source_url
+                        })
+            except Exception as e:
+                logger.error(f"RSS fetch error {url}: {e}")
+    return results
+
+async def scam_alert_scanner():
+    while True:
+        try:
+            logger.info("Scam alert scanner: starting RSS fetch")
+            rss_domains = await fetch_rss_domains()
+            logger.info(f"Scam alert scanner: found {len(rss_domains)} domains")
+            for item in rss_domains[:20]:
+                domain = item["domain"]
+                try:
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        check = await client.get(
+                            f"{SUPABASE_URL}/rest/v1/scam_alerts?domain=eq.{domain}&select=id,last_scanned",
+                            headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+                        )
+                        existing = check.json()
+                        if existing:
+                            last = existing[0].get("last_scanned")
+                            if last:
+                                from datetime import timezone
+                                last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                                if (datetime.now(timezone.utc) - last_dt).total_seconds() < 86400:
+                                    continue
+                    scan_result = await perform_full_scan(domain, user_id=None)
+                    risk_score = scan_result.get("risk_score", 0)
+                    verdict = scan_result.get("verdict", "unknown")
+                    if risk_score >= 40:
+                        payload = {
+                            "domain": domain,
+                            "source": item["source"],
+                            "source_url": item["source_url"],
+                            "headline": item["headline"],
+                            "risk_score": risk_score,
+                            "verdict": verdict,
+                            "scan_data": scan_result,
+                            "last_scanned": datetime.utcnow().isoformat()
+                        }
+                        async with httpx.AsyncClient(timeout=10) as client:
+                            await client.post(
+                                f"{SUPABASE_URL}/rest/v1/scam_alerts",
+                                headers={
+                                    "apikey": SUPABASE_SERVICE,
+                                    "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                                    "Content-Type": "application/json",
+                                    "Prefer": "resolution=merge-duplicates"
+                                },
+                                json=payload
+                            )
+                        logger.info(f"Scam alert saved: {domain} score={risk_score}")
+                    await asyncio.sleep(3)
+                except Exception as e:
+                    logger.error(f"Scam alert scan error {domain}: {e}")
+                    continue
+        except Exception as e:
+            logger.error(f"Scam alert scanner error: {e}")
+        await asyncio.sleep(6 * 3600)
+
 async def lifespan(app):
     asyncio.create_task(weekly_digest_scheduler())
+    asyncio.create_task(scam_alert_scanner())
     logger.info("Weekly digest scheduler started")
+    logger.info("Scam alert scanner started")
     yield
 
 app.router.lifespan_context = lifespan
