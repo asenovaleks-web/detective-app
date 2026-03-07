@@ -95,6 +95,7 @@ STRIPE_SECRET     = _env.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK    = _env.get("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PRICE_ID       = _env.get("STRIPE_PRICE_ID", "price_1T3cu8ACEfVvmWmy3Q6tZGFh")
 STRIPE_TEAM_PRICE_ID  = _env.get("STRIPE_TEAM_PRICE_ID", "")
+STRIPE_API_PRICE_ID   = _env.get("STRIPE_API_PRICE_ID", "price_1T8GgHPNIvT8lkjbFmWqhSvd")
 STRIPE_ONETIMESCAN_ID = _env.get("STRIPE_ONETIMESCAN_ID", "")  # One-time €4.99 scan report
 FRONTEND_URL      = _env.get("FRONTEND_URL", "https://signumaiapp.com")
 IPQS_KEY          = _env.get("IPQS_KEY", "")
@@ -1442,7 +1443,7 @@ async def api_check(req: APICheckRequest, request: Request):
         "score": result.get("score", 0),
         "verdict": result.get("verdict", "UNKNOWN"),
         "verdict_summary": result.get("verdict_summary", ""),
-        "findings": result.get("findings", []) if user_plan in ("pro", "team") else [],
+        "findings": result.get("findings", []) if user_plan in ("pro", "team", "api") else [],
         "cached": False,
         "scan_url": f"https://signumaiapp.com/?domain={domain}"
     }
@@ -2178,7 +2179,7 @@ async def create_checkout_session(req: CheckoutRequest):
             auth=(STRIPE_SECRET, ""),
             data={
                 "mode": "subscription",
-                "line_items[0][price]": STRIPE_TEAM_PRICE_ID if req.plan == "team" and STRIPE_TEAM_PRICE_ID else STRIPE_PRICE_ID,
+                "line_items[0][price]": STRIPE_TEAM_PRICE_ID if req.plan == "team" and STRIPE_TEAM_PRICE_ID else STRIPE_API_PRICE_ID if req.plan == "api" and STRIPE_API_PRICE_ID else STRIPE_PRICE_ID,
                 "line_items[0][quantity]": "1",
                 "customer_email": req.user_email,
                 "success_url": f"{FRONTEND_URL}?upgrade=success",
@@ -2634,7 +2635,7 @@ async def generate_report_endpoint(
     except Exception:
         plan = "free"
 
-    if plan not in ("pro", "team"):
+    if plan not in ("pro", "team", "api"):
         raise HTTPException(status_code=403, detail="PDF reports require a Pro or Team plan. Upgrade at signumaiapp.com")
 
     # Get latest scan result
@@ -2942,7 +2943,7 @@ async def send_weekly_digest():
                     timeout=5,
                 )
                 profile = r.json()[0] if r.status_code == 200 and r.json() else {}
-                if profile.get("plan", "free") not in ("pro", "team"):
+                if profile.get("plan", "free") not in ("pro", "team", "api"):
                     continue
 
                 r2 = await client.get(
