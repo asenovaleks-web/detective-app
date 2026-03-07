@@ -2941,6 +2941,7 @@ async def scam_alert_scanner():
             logger.error(f"Scam alert scanner error: {e}")
         await asyncio.sleep(6 * 3600)
 
+@asynccontextmanager
 async def lifespan(app):
     asyncio.create_task(weekly_digest_scheduler())
     asyncio.create_task(scam_alert_scanner())
