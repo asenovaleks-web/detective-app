@@ -43,6 +43,12 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# In-memory SEO cache: domain -> (result_dict, timestamp)
+_seo_mem_cache: dict = {}
+SEO_MEM_CACHE_TTL = 3600  # 1 hour
+
+
 app = FastAPI(title="The Digital Detective API", version="3.0.0")
 
 app.add_middleware(
@@ -1196,7 +1202,9 @@ async def update_watchlist_scores(domain: str, score: int, verdict: str):
 
 
 async def save_seo_scan_result(domain: str, result: dict):
-    """Save SEO scan result to scan_results table for caching."""
+    """Save SEO scan result to memory + Supabase."""
+    import time
+    _seo_mem_cache[domain] = (result, time.time())
     if not SUPABASE_URL:
         return
     try:
@@ -1216,15 +1224,22 @@ async def save_seo_scan_result(domain: str, result: dict):
         logger.warning(f"save_seo_scan_result error: {e}")
 
 async def get_seo_cached_result(domain: str) -> dict | None:
-    """Return full cached scan for SEO pages — checks scan_results table."""
+    """Return full cached scan for SEO pages — checks memory first, then Supabase."""
+    import time
+    # Check in-memory cache first (sub-millisecond)
+    if domain in _seo_mem_cache:
+        result, ts = _seo_mem_cache[domain]
+        if time.time() - ts < SEO_MEM_CACHE_TTL:
+            return result
+        else:
+            del _seo_mem_cache[domain]
+    # Fall back to Supabase (no time limit — use any cached result)
     if not SUPABASE_URL:
         return None
     try:
-        from datetime import timedelta
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         async with httpx.AsyncClient() as client:
             r = await client.get(
-                f"{SUPABASE_URL}/rest/v1/scan_results?domain=eq.{domain}&created_at=gte.{cutoff}&order=created_at.desc&limit=1",
+                f"{SUPABASE_URL}/rest/v1/scan_results?domain=eq.{domain}&order=created_at.desc&limit=1",
                 headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
                 timeout=5,
             )
@@ -1232,6 +1247,7 @@ async def get_seo_cached_result(domain: str) -> dict | None:
                 row = r.json()[0]
                 result = row.get("result_json", {})
                 if result and result.get("score") is not None:
+                    _seo_mem_cache[domain] = (result, time.time())
                     return result
     except Exception as e:
         logger.warning(f"get_seo_cached_result error: {e}")
