@@ -3224,7 +3224,7 @@ async def recent_activity():
             )
             rows = r.json() if r.status_code == 200 else []
 
-        # Deduplicate — keep most recent per domain
+        # Deduplicate — keep most recent per domain, skip UNKNOWN/score=0
         seen = {}
         for row in rows:
             d = row.get("domain", "")
@@ -3232,7 +3232,10 @@ async def recent_activity():
                 continue
             rj = row.get("result_json", {}) or {}
             score = rj.get("score", 0)
-            verdict = rj.get("verdict", "GREEN")
+            verdict = rj.get("verdict", "UNKNOWN")
+            # Only show domains with a real verdict and meaningful score
+            if verdict == "UNKNOWN" or score == 0:
+                continue
             seen[d] = {"domain": d, "score": score, "verdict": verdict}
             if len(seen) >= 8:
                 break
