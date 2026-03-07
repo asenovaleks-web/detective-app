@@ -2,7 +2,7 @@
 The Digital Detective — FastAPI Backend v4.0
 =============================================
 Data Sources (12 total — upgraded for accuracy):
-  1. WhoisXML — domain age & registrant
+  1. RDAP — domain age & registrant (free, no API key)
   2. VirusTotal — 93 malware engines
   3. Google Safe Browsing — threat database
   4. SSL — live certificate check
@@ -241,31 +241,81 @@ async def log_investigation(user_id: str, domain: str, verdict: str, score: int)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def check_whoisxml(domain: str, client: httpx.AsyncClient) -> dict:
-    if not WHOISXML_KEY:
-        return {"error": "No WhoisXML API key configured"}
-    try:
-        r = await client.get(
-            f"https://www.whoisxmlapi.com/whoisserver/WhoisService?apiKey={WHOISXML_KEY}&domainName={domain}&outputFormat=JSON",
-            timeout=10,
-        )
-        data = r.json().get("WhoisRecord", {})
-        created_raw = data.get("createdDate", "")
-        age_days = None
-        if created_raw:
-            try:
-                age_days = (datetime.now() - datetime.fromisoformat(created_raw[:10])).days
-            except Exception:
-                pass
-        return {
-            "domain": domain,
-            "created": created_raw[:10] if created_raw else "Unknown",
-            "age_days": age_days,
-            "registrar": data.get("registrarName", "Unknown"),
-            "privacy_protected": "privacy" in str(data).lower() or "proxy" in str(data).lower(),
-            "registrant_country": data.get("registrant", {}).get("country", "Unknown"),
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    """Domain age & registrant via RDAP — free, no API key needed."""
+    # Try RDAP bootstrap (works for most TLDs)
+    rdap_urls = [
+        f"https://rdap.org/domain/{domain}",
+        f"https://rdap.iana.org/domain/{domain}",
+    ]
+    for rdap_url in rdap_urls:
+        try:
+            r = await client.get(rdap_url, timeout=12, follow_redirects=True)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+
+            # Extract creation date from events
+            created_raw = None
+            expiry_raw = None
+            for event in data.get("events", []):
+                action = event.get("eventAction", "")
+                if action == "registration":
+                    created_raw = event.get("eventDate", "")
+                elif action == "expiration":
+                    expiry_raw = event.get("eventDate", "")
+
+            age_days = None
+            if created_raw:
+                try:
+                    age_days = (datetime.now(timezone.utc) - datetime.fromisoformat(created_raw.replace("Z", "+00:00"))).days
+                except Exception:
+                    try:
+                        age_days = (datetime.now() - datetime.fromisoformat(created_raw[:10])).days
+                    except Exception:
+                        pass
+
+            # Extract registrar
+            registrar = "Unknown"
+            for entity in data.get("entities", []):
+                roles = entity.get("roles", [])
+                if "registrar" in roles:
+                    vcard = entity.get("vcardArray", [])
+                    if vcard and len(vcard) > 1:
+                        for field in vcard[1]:
+                            if field[0] == "fn":
+                                registrar = field[3]
+                                break
+                    if registrar == "Unknown":
+                        registrar = entity.get("handle", "Unknown")
+
+            # Privacy protection detection
+            name_raw = str(data).lower()
+            privacy_protected = any(w in name_raw for w in ["privacy", "proxy", "redacted", "withheld", "protection"])
+
+            # Registrant country
+            registrant_country = "Unknown"
+            for entity in data.get("entities", []):
+                if "registrant" in entity.get("roles", []):
+                    vcard = entity.get("vcardArray", [])
+                    if vcard and len(vcard) > 1:
+                        for field in vcard[1]:
+                            if field[0] == "adr" and isinstance(field[3], list):
+                                registrant_country = field[3][-1] if field[3] else "Unknown"
+
+            return {
+                "domain": domain,
+                "created": created_raw[:10] if created_raw else "Unknown",
+                "expires": expiry_raw[:10] if expiry_raw else "Unknown",
+                "age_days": age_days,
+                "registrar": registrar,
+                "privacy_protected": privacy_protected,
+                "registrant_country": registrant_country,
+                "source": "rdap",
+            }
+        except Exception:
+            continue
+
+    return {"error": "RDAP lookup failed", "domain": domain, "age_days": None}
 
 
 _vt_quota_exceeded_until: Optional[datetime] = None
@@ -838,7 +888,7 @@ async def check_urlscan_screenshot(domain: str, client: httpx.AsyncClient) -> di
 
 
 async def check_dns_intel(domain: str, client: httpx.AsyncClient) -> dict:
-    """DNS intelligence — MX records, NS, A record age via WhoisXML DNS lookup."""
+    """DNS intelligence — MX records, NS, A record age via HackerTarget (free)."""
     try:
         results = {}
         # Check if domain resolves at all
@@ -851,18 +901,23 @@ async def check_dns_intel(domain: str, client: httpx.AsyncClient) -> dict:
             results["resolves"] = False
             results["ip"] = None
 
-        # DNS History via WhoisXML (if key available)
-        if WHOISXML_KEY:
-            r = await client.get(
-                f"https://dns-history.whoisxmlapi.com/api/v1?apiKey={WHOISXML_KEY}&domainName={domain}&type=A",
-                timeout=10,
+        # DNS history via HackerTarget (free, no key needed)
+        try:
+            ht = await client.get(
+                f"https://api.hackertarget.com/hostsearch/?q={domain}",
+                timeout=8,
             )
-            if r.status_code == 200:
-                records = r.json().get("result", {}).get("records", [])
-                ips_seen = list(set([rec.get("value", "") for rec in records if rec.get("value")]))
+            if ht.status_code == 200 and "error" not in ht.text.lower():
+                ips_seen = list(set([
+                    line.split(",")[1].strip()
+                    for line in ht.text.strip().splitlines()
+                    if "," in line
+                ]))
                 results["historical_ips"] = ips_seen[:5]
                 results["ip_changes"] = len(ips_seen)
                 results["frequent_ip_changes"] = len(ips_seen) > 3
+        except Exception:
+            pass
 
         return results
     except Exception as e:
