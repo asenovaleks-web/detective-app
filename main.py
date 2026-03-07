@@ -1764,6 +1764,180 @@ async def send_reset(req: SendResetRequest):
         return {"ok": False, "error": str(e)}
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEO LANDING PAGES — /is-[domain]-safe
+# ══════════════════════════════════════════════════════════════════════════════
+from fastapi.responses import HTMLResponse
+
+def _verdict_color(verdict: str) -> str:
+    return {"GREEN": "#22c55e", "RED": "#ef4444", "YELLOW": "#eab308"}.get(verdict, "#eab308")
+
+def _verdict_emoji(verdict: str) -> str:
+    return {"GREEN": "✅", "RED": "🔴", "YELLOW": "⚠️"}.get(verdict, "⚠️")
+
+def _verdict_label(verdict: str) -> str:
+    return {"GREEN": "Safe", "RED": "Danger", "YELLOW": "Caution"}.get(verdict, "Unknown")
+
+def build_seo_page(domain: str, result: dict) -> str:
+    score     = result.get("score", 0)
+    verdict   = result.get("verdict", "YELLOW")
+    summary   = result.get("verdict_summary", "")
+    findings  = result.get("findings", [])
+    narrative = result.get("narrative", "")
+    color     = _verdict_color(verdict)
+    emoji     = _verdict_emoji(verdict)
+    label     = _verdict_label(verdict)
+    scan_url  = f"https://signumaiapp.com/?domain={domain}"
+
+    findings_html = ""
+    for f in findings[:5]:
+        findings_html += f'''
+        <div style="display:flex;gap:12px;padding:14px 0;border-bottom:1px solid #1e293b;">
+          <span style="font-size:18px;flex-shrink:0;">{f.get("icon","ℹ️")}</span>
+          <div>
+            <span style="font-size:11px;font-weight:700;letter-spacing:0.5px;color:{color};background:rgba(255,255,255,0.05);padding:2px 8px;border-radius:4px;margin-bottom:6px;display:inline-block;">{f.get("tag","INFO")}</span>
+            <p style="font-size:14px;color:#94a3b8;line-height:1.6;margin:4px 0 0;">{f.get("text","")}</p>
+          </div>
+        </div>'''
+
+    title = f"Is {domain} safe? — Signum Trust Report"
+    description = f"Independent AI trust scan of {domain}. Score: {score}/100 — {label}. {summary[:120]}"
+
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>{title}</title>
+  <meta name="description" content="{description}"/>
+  <meta property="og:title" content="{emoji} Is {domain} safe? Score: {score}/100"/>
+  <meta property="og:description" content="{description}"/>
+  <meta property="og:url" content="https://detective-app-production-7080.up.railway.app/is-{domain}-safe"/>
+  <meta name="twitter:card" content="summary"/>
+  <link rel="canonical" href="https://signumaiapp.com/?domain={domain}"/>
+  <style>
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0a0f1e;color:#e2e8f0;min-height:100vh}}
+    a{{color:#3b82f6;text-decoration:none}}
+    .wrap{{max-width:680px;margin:0 auto;padding:32px 16px 64px}}
+    .badge{{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;letter-spacing:0.8px;padding:4px 14px;border-radius:100px;border:1px solid;margin-bottom:20px}}
+    .score-ring{{width:80px;height:80px;flex-shrink:0}}
+    .cta{{display:inline-block;background:#3b82f6;color:#fff;font-weight:700;padding:14px 28px;border-radius:10px;font-size:15px;margin-top:8px}}
+    .cta:hover{{opacity:0.9}}
+    @media(max-width:480px){{.verdict-top{{flex-direction:column!important;text-align:center}}}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div style="margin-bottom:28px;">
+      <a href="https://signumaiapp.com" style="font-size:13px;color:#64748b;">← signumaiapp.com</a>
+    </div>
+
+    <div class="badge" style="color:{color};border-color:{color};background:rgba(255,255,255,0.03);">
+      SIGNUM TRUST REPORT
+    </div>
+
+    <h1 style="font-size:clamp(22px,4vw,32px);font-weight:800;letter-spacing:-0.8px;margin-bottom:8px;line-height:1.2;">
+      {emoji} Is <em style="font-style:normal;color:{color};">{domain}</em> safe?
+    </h1>
+    <p style="font-size:15px;color:#64748b;margin-bottom:28px;">AI-powered trust analysis · Updated automatically</p>
+
+    <!-- Verdict card -->
+    <div style="background:#111827;border:1px solid #1e293b;border-radius:14px;padding:24px;margin-bottom:24px;border-left:3px solid {color};">
+      <div class="verdict-top" style="display:flex;gap:20px;align-items:center;margin-bottom:16px;">
+        <svg class="score-ring" viewBox="0 0 80 80">
+          <circle cx="40" cy="40" r="33" fill="none" stroke="#1e293b" stroke-width="7"/>
+          <circle cx="40" cy="40" r="33" fill="none" stroke="{color}" stroke-width="7"
+            stroke-dasharray="207" stroke-dashoffset="{round(207 - (score/100)*207)}"
+            stroke-linecap="round" transform="rotate(-90 40 40)"/>
+          <text x="40" y="45" text-anchor="middle" fill="{color}" font-size="18" font-weight="800">{score}</text>
+        </svg>
+        <div>
+          <div style="font-size:28px;font-weight:800;color:{color};">{label}</div>
+          <div style="font-size:14px;color:#94a3b8;margin-top:4px;">{summary}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Findings -->
+    {"" if not findings_html else f'<div style="background:#111827;border:1px solid #1e293b;border-radius:14px;padding:20px 24px;margin-bottom:24px;"><h2 style="font-size:14px;font-weight:700;letter-spacing:0.5px;color:#64748b;margin-bottom:4px;">FINDINGS</h2>{findings_html}</div>'}
+
+    <!-- Narrative -->
+    {f'<div style="background:#111827;border:1px solid #1e293b;border-radius:14px;padding:20px 24px;margin-bottom:28px;"><h2 style="font-size:14px;font-weight:700;letter-spacing:0.5px;color:#64748b;margin-bottom:12px;">ANALYSIS</h2><p style="font-size:14px;color:#94a3b8;line-height:1.7;">{narrative}</p></div>' if narrative else ""}
+
+    <!-- CTA -->
+    <div style="text-align:center;padding:28px;background:#111827;border:1px solid #1e293b;border-radius:14px;">
+      <p style="font-size:16px;font-weight:700;margin-bottom:6px;">Check any website for free</p>
+      <p style="font-size:14px;color:#64748b;margin-bottom:18px;">Signum scans any domain in seconds — malware, scam signals, age, reputation and more.</p>
+      <a class="cta" href="{scan_url}">Scan {domain} live →</a>
+    </div>
+
+    <p style="font-size:12px;color:#334155;text-align:center;margin-top:24px;">
+      Powered by <a href="https://signumaiapp.com">Signum</a> · AI trust intelligence
+    </p>
+  </div>
+</body>
+</html>'''
+
+
+@app.get("/is-{domain}-safe", response_class=HTMLResponse)
+async def seo_domain_page(domain: str):
+    """SEO landing page for domain trust queries."""
+    domain = clean_domain(domain)
+    if not domain or len(domain) < 4 or "." not in domain:
+        return HTMLResponse("<h1>Invalid domain</h1>", status_code=400)
+
+    # Try cache first
+    cached = await get_cached_scan(domain)
+    if cached:
+        result = {
+            "domain": domain,
+            "score": cached.get("last_score", 0),
+            "verdict": cached.get("last_verdict", "YELLOW"),
+            "verdict_summary": cached.get("verdict_summary", ""),
+            "findings": cached.get("findings", []),
+            "narrative": cached.get("narrative", ""),
+        }
+    else:
+        # Run fresh scan (non-blocking for SEO bots, still returns result)
+        result = await perform_full_scan(domain)
+
+    html_page = build_seo_page(domain, result)
+    return HTMLResponse(
+        content=html_page,
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "X-Robots-Tag": "index, follow"
+        }
+    )
+
+
+
+@app.get("/sitemap-domains.xml", response_class=HTMLResponse)
+async def sitemap_domains():
+    """Sitemap for SEO domain landing pages."""
+    domains = [
+        "amazon.com","ebay.com","temu.com","shein.com","aliexpress.com",
+        "binance.com","coinbase.com","kraken.com","bybit.com","kucoin.com",
+        "paypal.com","wise.com","revolut.com","stripe.com","cashapp.com",
+        "fiverr.com","upwork.com","freelancer.com","toptal.com","guru.com",
+        "airbnb.com","booking.com","expedia.com","tripadvisor.com","vrbo.com",
+        "etsy.com","wish.com","banggood.com","dhgate.com","aliexpress.com",
+        "robinhood.com","webull.com","tradingview.com","plus500.com","ig.com",
+        "instagram.com","facebook.com","twitter.com","tiktok.com","youtube.com",
+    ]
+    base = "https://detective-app-production-7080.up.railway.app"
+    urls = "\n".join([
+        f"  <url><loc>{base}/is-{d}-safe</loc><changefreq>weekly</changefreq><priority>0.7</priority></url>"
+        for d in domains
+    ])
+    xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+{urls}
+</urlset>'''
+    return HTMLResponse(content=xml, media_type="application/xml")
+
 @app.get("/health")
 async def health():
     return {"status": "The detective is on duty", "timestamp": datetime.now(timezone.utc).isoformat()}
@@ -2121,6 +2295,7 @@ class SingleScanRequest(BaseModel):
 class CheckoutRequest(BaseModel):
     user_token: str
     user_email: str
+    plan: str = "pro"
 
 
 @app.post("/create-scan-checkout")
