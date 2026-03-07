@@ -1193,6 +1193,50 @@ async def update_watchlist_scores(domain: str, score: int, verdict: str):
         logger.warning(f"Failed to update watchlist scores: {e}")
 
 
+
+
+async def save_seo_scan_result(domain: str, result: dict):
+    """Save SEO scan result to scan_results table for caching."""
+    if not SUPABASE_URL:
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/scan_results",
+                headers={
+                    "apikey": SUPABASE_SERVICE,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates"
+                },
+                json={"domain": domain, "result_json": result, "user_id": None},
+                timeout=5,
+            )
+    except Exception as e:
+        logger.warning(f"save_seo_scan_result error: {e}")
+
+async def get_seo_cached_result(domain: str) -> dict | None:
+    """Return full cached scan for SEO pages — checks scan_results table."""
+    if not SUPABASE_URL:
+        return None
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/scan_results?domain=eq.{domain}&created_at=gte.{cutoff}&order=created_at.desc&limit=1",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                timeout=5,
+            )
+            if r.status_code == 200 and r.json():
+                row = r.json()[0]
+                result = row.get("result_json", {})
+                if result and result.get("score") is not None:
+                    return result
+    except Exception as e:
+        logger.warning(f"get_seo_cached_result error: {e}")
+    return None
+
 async def get_cached_scan(domain: str) -> dict | None:
     """Return cached scan result if scanned in last 24 hours."""
     if not SUPABASE_URL:
@@ -1888,20 +1932,13 @@ async def seo_domain_page(domain: str):
     if not domain or len(domain) < 4 or "." not in domain:
         return HTMLResponse("<h1>Invalid domain</h1>", status_code=400)
 
-    # Try cache first
-    cached = await get_cached_scan(domain)
-    if cached:
-        result = {
-            "domain": domain,
-            "score": cached.get("last_score", 0),
-            "verdict": cached.get("last_verdict", "YELLOW"),
-            "verdict_summary": cached.get("verdict_summary", ""),
-            "findings": cached.get("findings", []),
-            "narrative": cached.get("narrative", ""),
-        }
-    else:
-        # Run fresh scan (non-blocking for SEO bots, still returns result)
+    # Try full cache from scan_results (has findings + narrative)
+    result = await get_seo_cached_result(domain)
+    if not result:
         result = await perform_full_scan(domain)
+        # Save to scan_results for future cache hits
+        if result and result.get("score") is not None:
+            asyncio.create_task(save_seo_scan_result(domain, result))
 
     html_page = build_seo_page(domain, result)
     return HTMLResponse(
