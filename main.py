@@ -1287,10 +1287,175 @@ async def upsert_domain_scan(domain: str, score: int, verdict: str):
         logger.warning(f"Failed to upsert domain scan: {e}")
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RATE LIMITING
+# ══════════════════════════════════════════════════════════════════════════════
+from collections import defaultdict
+import time as _time
+
+_rate_store: dict = defaultdict(list)  # ip -> [timestamps]
+
+def is_rate_limited(ip: str, max_calls: int = 10, window: int = 60) -> bool:
+    """Sliding window rate limiter. Returns True if request should be blocked."""
+    now = _time.time()
+    calls = _rate_store[ip]
+    # Remove old calls outside window
+    _rate_store[ip] = [t for t in calls if now - t < window]
+    if len(_rate_store[ip]) >= max_calls:
+        return True
+    _rate_store[ip].append(now)
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REUSABLE SCAN CORE — used by /investigate, /api/check, scam_alert_scanner
+# ══════════════════════════════════════════════════════════════════════════════
+async def perform_full_scan(domain: str, user_id: str = None) -> dict:
+    """Run full scan pipeline. Returns raw result dict."""
+    try:
+        domain = clean_domain(domain)
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            tasks = [
+                check_whoisxml(domain, client),
+                check_virustotal(domain, client),
+                check_google_safe_browsing(domain, client),
+                check_ssl_info(domain, client),
+                check_urlscan_screenshot(domain, client),
+                check_trustpilot(domain, client),
+                check_wayback_machine(domain, client),
+                check_shodan(domain, client),
+                check_ipqs(domain, client),
+                check_abuseipdb(domain, client),
+                check_otx(domain, client),
+                check_dns_intel(domain, client),
+                check_companies_house(domain, client),
+                check_sec_edgar(domain, client),
+                check_gleif(domain, client),
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        (whois_data, vt_data, gsb_data, ssl_data, urlscan_data,
+         trustpilot_data, wayback_data, shodan_data,
+         ipqs_data, abuseipdb_data, otx_data, dns_data,
+         companies_house_data, sec_edgar_data, gleif_data) = results
+
+        all_intelligence = {
+            "target": domain,
+            "whois": whois_data,
+            "companies_house": companies_house_data,
+            "sec_edgar": sec_edgar_data,
+            "gleif": gleif_data,
+            "virustotal": vt_data,
+            "google_safe_browsing": gsb_data,
+            "ssl": ssl_data,
+            "urlscan": urlscan_data,
+            "trustpilot": trustpilot_data,
+            "wayback_machine": wayback_data,
+            "shodan": shodan_data,
+            "ipqs": ipqs_data,
+            "abuseipdb": abuseipdb_data,
+            "otx_alienvault": otx_data,
+            "dns_intelligence": dns_data,
+        }
+
+        base_score, data_confidence = calculate_base_score(
+            vt_data, gsb_data, whois_data, ssl_data, ipqs_data
+        )
+        all_intelligence["base_score"] = base_score
+        all_intelligence["data_confidence"] = data_confidence
+
+        analysis = await synthesize_with_claude(domain, all_intelligence, base_score, data_confidence)
+
+        return {
+            "domain": domain,
+            "score": analysis.get("score", base_score),
+            "risk_score": analysis.get("score", base_score),
+            "verdict": analysis.get("verdict", "YELLOW"),
+            "verdict_summary": analysis.get("verdict_summary", ""),
+            "findings": analysis.get("findings", []),
+            "narrative": analysis.get("narrative", ""),
+            "raw_labels": analysis.get("raw_labels", {}),
+            "data_confidence": data_confidence,
+        }
+    except Exception as e:
+        logger.error(f"perform_full_scan error for {domain}: {e}")
+        return {"domain": domain, "score": 0, "risk_score": 0, "verdict": "UNKNOWN", "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PUBLIC API — /api/check (for Chrome extension + B2B)
+# ══════════════════════════════════════════════════════════════════════════════
+class APICheckRequest(BaseModel):
+    domain: str
+    api_key: str
+
+@app.post("/api/check")
+async def api_check(req: APICheckRequest, request: Request):
+    """Public API endpoint for extension and B2B integrations."""
+    # Rate limit by IP
+    client_ip = request.client.host
+    if is_rate_limited(client_ip, max_calls=30, window=60):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Max 30 requests/minute.")
+
+    # Validate API key — check against Supabase profiles
+    if not req.api_key:
+        raise HTTPException(status_code=401, detail="API key required.")
+
+    user_id = None
+    user_plan = "free"
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/profiles?api_key=eq.{req.api_key}&select=id,plan",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+            )
+            data = r.json()
+            if not data:
+                raise HTTPException(status_code=401, detail="Invalid API key.")
+            user_id = data[0]["id"]
+            user_plan = data[0].get("plan", "free")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Auth error.")
+
+    domain = clean_domain(req.domain)
+
+    # Check cache first (24h)
+    cached = await get_cached_scan(domain)
+    if cached:
+        return {
+            "domain": domain,
+            "score": cached.get("last_score", 0),
+            "verdict": cached.get("last_verdict", "UNKNOWN"),
+            "cached": True,
+            "scan_url": f"https://signumaiapp.com/?domain={domain}"
+        }
+
+    # Full scan
+    result = await perform_full_scan(domain, user_id=user_id)
+    await upsert_domain_scan(domain, result.get("score", 0), result.get("verdict", "UNKNOWN"))
+
+    return {
+        "domain": domain,
+        "score": result.get("score", 0),
+        "verdict": result.get("verdict", "UNKNOWN"),
+        "verdict_summary": result.get("verdict_summary", ""),
+        "findings": result.get("findings", []) if user_plan in ("pro", "team") else [],
+        "cached": False,
+        "scan_url": f"https://signumaiapp.com/?domain={domain}"
+    }
+
 @app.post("/investigate", response_model=InvestigateResponse)
-async def investigate(req: InvestigateRequest):
+async def investigate(req: InvestigateRequest, request: Request):
     try:
         domain = clean_domain(req.target)
+
+        # Rate limit anonymous users
+        client_ip = request.client.host
+        if not req.user_token and is_rate_limited(client_ip, max_calls=5, window=60):
+            raise HTTPException(status_code=429, detail="Too many requests. Please sign in or slow down.")
         logger.info(f"Investigating domain: {domain}")
 
         # ── User auth & free tier check ───────────────────────────────────
@@ -1308,7 +1473,7 @@ async def investigate(req: InvestigateRequest):
                     if daily_count >= FREE_DAILY_LIMIT:
                         raise HTTPException(
                             status_code=429,
-                            detail=f"Free tier limit reached ({FREE_DAILY_LIMIT} investigations/day). Upgrade to Pro for unlimited investigations."
+                            detail=f"Free plan: {FREE_DAILY_LIMIT} scans/day used. Upgrade to Pro for unlimited scans — signumaiapp.com/#pricing"
                         )
         elif SUPABASE_URL and not req.user_token:
             # Anonymous user — allow but don't log
@@ -2701,6 +2866,29 @@ async def trending_threats():
         logger.error(f"trending_threats error: {e}")
         return {"threats": []}
 
+
+
+@app.get("/api-key")
+async def get_api_key(authorization: str = Header(None)):
+    """Return the API key for the authenticated user."""
+    token = authorization.replace("Bearer ", "") if authorization else ""
+    user = await get_user_from_token(token) if token else None
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user['id']}&select=api_key",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+            )
+            data = r.json()
+            if data:
+                return {"api_key": data[0].get("api_key", "")}
+            raise HTTPException(status_code=404, detail="Profile not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/scam-alerts")
 async def get_scam_alerts(limit: int = 10):
