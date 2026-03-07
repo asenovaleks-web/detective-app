@@ -969,7 +969,7 @@ Only mention regional registries in findings if they return something meaningful
 IMPORTANT DISTINCTIONS:
 - "Unknown domain age" means insufficient data — NOT a risk signal on its own.
 - A domain not found in VirusTotal (404) means it has no history there — treat as NEUTRAL, not suspicious.
-- If VirusTotal data shows {"skipped": true, "reason": "daily_quota_exceeded"} — the API quota is exhausted for today. Ignore this source entirely and base the verdict on the remaining sources.
+- If VirusTotal data contains skipped=true or reason=daily_quota_exceeded — the API quota is exhausted for today. Ignore this source entirely and base the verdict on the remaining sources.
 - New domains (< 6 months) are worth noting as CAUTION but not automatically dangerous.
 - Base score provided: {base_score}/100. Use this as your anchor and adjust based on qualitative signals.
 - Data confidence level: {data_confidence}. Reflect this in your verdict_summary if confidence is low.
