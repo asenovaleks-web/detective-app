@@ -1530,12 +1530,7 @@ class APICheckRequest(BaseModel):
 @app.post("/api/check")
 async def api_check(req: APICheckRequest, request: Request):
     """Public API endpoint for extension and B2B integrations."""
-    # Rate limit by IP
-    client_ip = request.client.host
-    if is_rate_limited(client_ip, max_calls=30, window=60):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Max 30 requests/minute.")
-
-    # Validate API key — check against Supabase profiles
+    # Validate API key first — need plan before applying rate limit
     if not req.api_key:
         raise HTTPException(status_code=401, detail="API key required.")
 
@@ -1554,18 +1549,34 @@ async def api_check(req: APICheckRequest, request: Request):
             user_plan = data[0].get("plan", "free")
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Auth error.")
+
+    # Plan enforcement — only api plan can use this endpoint
+    if user_plan not in ("api", "team"):
+        raise HTTPException(
+            status_code=403,
+            detail="API access requires the API plan. Upgrade at https://signumaiapp.com"
+        )
+
+    # Per-plan rate limits
+    plan_limits = {"api": 60, "team": 60}
+    max_calls = plan_limits.get(user_plan, 60)
+    client_ip = request.client.host
+    if is_rate_limited(client_ip, max_calls=max_calls, window=60):
+        raise HTTPException(status_code=429, detail=f"Rate limit exceeded. Max {max_calls} requests/minute.")
 
     domain = clean_domain(req.domain)
 
-    # Check cache first (24h)
+    # Check cache first (24h) — do full scan if only partial data cached
     cached = await get_cached_scan(domain)
     if cached:
         return {
             "domain": domain,
             "score": cached.get("last_score", 0),
             "verdict": cached.get("last_verdict", "UNKNOWN"),
+            "verdict_summary": "",
+            "findings": [],
             "cached": True,
             "scan_url": f"https://signumaiapp.com/?domain={domain}"
         }
@@ -1579,7 +1590,7 @@ async def api_check(req: APICheckRequest, request: Request):
         "score": result.get("score", 0),
         "verdict": result.get("verdict", "UNKNOWN"),
         "verdict_summary": result.get("verdict_summary", ""),
-        "findings": result.get("findings", []) if user_plan in ("pro", "team", "api") else [],
+        "findings": result.get("findings", []),
         "cached": False,
         "scan_url": f"https://signumaiapp.com/?domain={domain}"
     }
