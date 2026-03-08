@@ -55,7 +55,17 @@ REPORT_RATE_WINDOW = 3600   # per hour (seconds)
 
 
 
-app = FastAPI(title="The Digital Detective API", version="3.0.0")
+@asynccontextmanager
+async def lifespan(app):
+    asyncio.create_task(weekly_digest_scheduler())
+    asyncio.create_task(scam_alert_scanner())
+    asyncio.create_task(watchlist_rescan_cron())
+    logger.info("Weekly digest scheduler started")
+    logger.info("Scam alert scanner started")
+    logger.info("Watchlist rescan cron started")
+    yield
+
+app = FastAPI(title="The Digital Detective API", version="3.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -3688,17 +3698,7 @@ async def watchlist_rescan_cron():
         await asyncio.sleep(86400)  # 24 hours
 
 
-@asynccontextmanager
-async def lifespan(app):
-    asyncio.create_task(weekly_digest_scheduler())
-    asyncio.create_task(scam_alert_scanner())
-    asyncio.create_task(watchlist_rescan_cron())
-    logger.info("Weekly digest scheduler started")
-    logger.info("Scam alert scanner started")
-    logger.info("Watchlist rescan cron started")
-    yield
 
-app.router.lifespan_context = lifespan
 
 
 if __name__ == "__main__":
