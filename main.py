@@ -2346,6 +2346,42 @@ class ContactRequest(BaseModel):
     subject: str
     message: str
 
+
+@app.post("/affiliate-apply")
+async def affiliate_apply(request: Request):
+    """Handle affiliate program applications — forward to email."""
+    try:
+        body = await request.json()
+        name = body.get("name", "").strip()
+        email = body.get("email", "").strip()
+        channel = body.get("channel", "")
+        url = body.get("url", "").strip()
+        audience = body.get("audience", "")
+        note = body.get("note", "").strip()
+        if not name or not email:
+            raise HTTPException(status_code=400, detail="Missing fields")
+        if not RESEND_KEY:
+            raise HTTPException(status_code=503, detail="Email not configured")
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
+                json={
+                    "from": "Signum Affiliates <noreply@signumaiapp.com>",
+                    "to": ["hello@signumaiapp.com"],
+                    "reply_to": email,
+                    "subject": f"[Affiliate Application] {name} — {channel} — {audience}",
+                    "text": f"Name: {name}\nEmail: {email}\nChannel: {channel}\nURL: {url}\nAudience: {audience}\n\nHow they'll promote Signum:\n{note}"
+                },
+                timeout=10,
+            )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"affiliate_apply error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send")
+
 @app.post("/contact")
 async def contact_form(req: ContactRequest):
     """Handle contact form submissions."""
@@ -3171,6 +3207,42 @@ body{{background:#0a0f1e;color:#e2e8f0;font-family:"DM Sans",sans-serif;min-heig
     from fastapi.responses import HTMLResponse
     return HTMLResponse(content=html)
 
+
+
+@app.post("/affiliate-apply")
+async def affiliate_apply(request: Request):
+    """Handle affiliate program applications — forward to email."""
+    try:
+        body = await request.json()
+        name = body.get("name", "").strip()
+        email = body.get("email", "").strip()
+        channel = body.get("channel", "")
+        url = body.get("url", "").strip()
+        audience = body.get("audience", "")
+        note = body.get("note", "").strip()
+        if not name or not email:
+            raise HTTPException(status_code=400, detail="Missing fields")
+        if not RESEND_KEY:
+            raise HTTPException(status_code=503, detail="Email not configured")
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
+                json={
+                    "from": "Signum Affiliates <noreply@signumaiapp.com>",
+                    "to": ["hello@signumaiapp.com"],
+                    "reply_to": email,
+                    "subject": f"[Affiliate Application] {name} — {channel} — {audience}",
+                    "text": f"Name: {name}\nEmail: {email}\nChannel: {channel}\nURL: {url}\nAudience: {audience}\n\nHow they'll promote Signum:\n{note}"
+                },
+                timeout=10,
+            )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"affiliate_apply error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send")
 
 @app.post("/contact")
 async def contact_form(request: Request):
