@@ -3645,12 +3645,57 @@ async def scam_alert_scanner():
             logger.error(f"Scam alert scanner error: {e}")
         await asyncio.sleep(6 * 3600)
 
+
+async def watchlist_rescan_cron():
+    """Rescan all watchlist domains every 24 hours and send alerts on verdict changes."""
+    await asyncio.sleep(60)  # Wait 1 min after startup before first run
+    while True:
+        try:
+            logger.info("Watchlist cron: starting rescan cycle")
+            if not SUPABASE_URL:
+                await asyncio.sleep(86400)
+                continue
+
+            # Fetch all unique domains currently in any watchlist
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/watchlist?select=domain&order=domain",
+                    headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                )
+                rows = r.json() if r.status_code == 200 else []
+
+            domains = list({row["domain"] for row in rows if row.get("domain")})
+            logger.info(f"Watchlist cron: {len(domains)} unique domains to rescan")
+
+            for domain in domains:
+                try:
+                    result = await perform_full_scan(domain)
+                    score = result.get("score", 0)
+                    verdict = result.get("verdict", "UNKNOWN")
+                    if verdict != "UNKNOWN" and score > 0:
+                        await upsert_domain_scan(domain, score, verdict)
+                        await update_watchlist_scores(domain, score, verdict)
+                    # Stagger scans — 8 seconds between each to avoid rate limits
+                    await asyncio.sleep(8)
+                except Exception as e:
+                    logger.warning(f"Watchlist cron: failed to rescan {domain}: {e}")
+                    await asyncio.sleep(4)
+
+            logger.info("Watchlist cron: rescan cycle complete, sleeping 24h")
+        except Exception as e:
+            logger.error(f"Watchlist cron error: {e}")
+
+        await asyncio.sleep(86400)  # 24 hours
+
+
 @asynccontextmanager
 async def lifespan(app):
     asyncio.create_task(weekly_digest_scheduler())
     asyncio.create_task(scam_alert_scanner())
+    asyncio.create_task(watchlist_rescan_cron())
     logger.info("Weekly digest scheduler started")
     logger.info("Scam alert scanner started")
+    logger.info("Watchlist rescan cron started")
     yield
 
 app.router.lifespan_context = lifespan
