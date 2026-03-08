@@ -37,6 +37,7 @@ from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 from typing import Optional
 
 load_dotenv()
@@ -3540,7 +3541,6 @@ async def weekly_digest_scheduler():
         await send_weekly_digest()
 
 
-from contextlib import asynccontextmanager
 
 RSS_SOURCES = [
     "https://www.reddit.com/r/Scams/new/.rss",
