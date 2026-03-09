@@ -49,6 +49,10 @@ logger = logging.getLogger(__name__)
 _seo_mem_cache: dict = {}
 SEO_MEM_CACHE_TTL = 3600  # 1 hour
 
+# Global in-memory scan cache: domain -> (result_dict, timestamp)
+_scan_mem_cache: dict = {}
+SCAN_MEM_CACHE_TTL = 21600  # 6 hours
+
 # Rate limiting for /report-site: user_id -> list of timestamps
 _report_rate_limit: dict = {}
 REPORT_RATE_LIMIT = 3       # max reports
@@ -1657,10 +1661,32 @@ async def investigate(req: InvestigateRequest, request: Request):
             }
             return InvestigateResponse(**trusted_result, target=req.target, raw_data={})
 
-        # -- 6-hour result cache --
+        # -- 6-hour result cache: memory first (fast), then DB fallback --
+        import time as _t
+        _mem_hit = _scan_mem_cache.get(domain)
+        if _mem_hit:
+            _cached_result, _cached_ts = _mem_hit
+            if _t.time() - _cached_ts < SCAN_MEM_CACHE_TTL:
+                logger.info(f"Memory cache hit for {domain}")
+                return InvestigateResponse(
+                    target=req.target,
+                    score=_cached_result.get("score", 0),
+                    verdict=_cached_result.get("verdict", "YELLOW"),
+                    verdict_summary=_cached_result.get("verdict_summary", ""),
+                    findings=_cached_result.get("findings", []),
+                    narrative=_cached_result.get("narrative", ""),
+                    raw_labels=_cached_result.get("raw_labels", {}),
+                    raw_data={},
+                    data_confidence=_cached_result.get("data_confidence", "medium"),
+                    scan_count=0,
+                )
+            else:
+                del _scan_mem_cache[domain]
+
         if user_id:
             cached = await get_full_cached_result(domain, user_id)
             if cached:
+                _scan_mem_cache[domain] = (cached, _t.time())
                 return InvestigateResponse(
                     target=req.target,
                     score=cached.get("score", 0),
@@ -1764,6 +1790,9 @@ async def investigate(req: InvestigateRequest, request: Request):
                 "scanned_at": datetime.now(timezone.utc).strftime("%d %b %H:%M"),
             }
             asyncio.create_task(save_scan_result(user_id, domain, result_dict))
+            # Store in memory cache so next scan is instant
+            import time as _t2
+            _scan_mem_cache[domain] = (result_dict, _t2.time())
 
         # ── Upsert domain scan stats ──────────────────────────────────────
         await upsert_domain_scan(domain, final_score, final_verdict)
