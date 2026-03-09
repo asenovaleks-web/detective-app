@@ -944,11 +944,12 @@ async def check_urlscan_screenshot(domain: str, client: httpx.AsyncClient) -> di
 
 
 async def check_dns_intel(domain: str, client: httpx.AsyncClient) -> dict:
-    """DNS intelligence — MX records, NS, A record age via HackerTarget (free)."""
+    """DNS intelligence — MX, SPF, DMARC, NS records + IP history."""
     try:
         results = {}
-        # Check if domain resolves at all
         loop = asyncio.get_event_loop()
+
+        # Resolve IP
         try:
             ip = await loop.run_in_executor(None, lambda: socket.gethostbyname(domain))
             results["resolves"] = True
@@ -957,7 +958,60 @@ async def check_dns_intel(domain: str, client: httpx.AsyncClient) -> dict:
             results["resolves"] = False
             results["ip"] = None
 
-        # DNS history via HackerTarget (free, no key needed)
+        # Try dnspython for rich DNS records
+        try:
+            import dns.resolver as _dns
+
+            def _query(qtype):
+                try:
+                    r = _dns.resolve(domain, qtype, lifetime=5)
+                    return [str(x) for x in r]
+                except Exception:
+                    return []
+
+            mx = await loop.run_in_executor(None, lambda: _query("MX"))
+            results["has_mx"] = len(mx) > 0
+            results["mx_records"] = mx[:3]
+            mx_str = " ".join(mx).lower()
+            results["uses_free_email"] = any(p in mx_str for p in ["google", "gmail", "yahoo", "outlook", "hotmail", "protonmail"])
+            results["no_email_server"] = len(mx) == 0
+
+            txt_records = await loop.run_in_executor(None, lambda: _query("TXT"))
+            spf = [t for t in txt_records if "v=spf1" in t.lower()]
+            results["has_spf"] = len(spf) > 0
+            results["spf_record"] = spf[0] if spf else None
+
+            try:
+                def _dmarc():
+                    try:
+                        r2 = _dns.resolve(f"_dmarc.{domain}", "TXT", lifetime=5)
+                        return [str(x) for x in r2 if "v=dmarc1" in str(x).lower()]
+                    except Exception:
+                        return []
+                dmarc = await loop.run_in_executor(None, _dmarc)
+                results["has_dmarc"] = len(dmarc) > 0
+                results["dmarc_record"] = dmarc[0] if dmarc else None
+            except Exception:
+                results["has_dmarc"] = False
+
+            ns = await loop.run_in_executor(None, lambda: _query("NS"))
+            results["nameservers"] = ns[:3]
+            ns_str = " ".join(ns).lower()
+            results["uses_cloudflare_ns"] = "cloudflare" in ns_str
+            SUSPICIOUS_NS = ["namecheap", "reg.ru", "regway", "nicenic", "above.com"]
+            results["suspicious_ns"] = any(s in ns_str for s in SUSPICIOUS_NS)
+
+            email_sec = (1 if results.get("has_spf") else 0) + \
+                        (1 if results.get("has_dmarc") else 0) + \
+                        (1 if results.get("has_mx") else 0)
+            results["email_security_score"] = email_sec
+            results["poor_email_security"] = email_sec == 0
+
+        except ImportError:
+            # dnspython not available — skip rich DNS checks
+            results["dns_note"] = "dnspython not available"
+
+        # IP history via HackerTarget (always works, no deps)
         try:
             ht = await client.get(
                 f"https://api.hackertarget.com/hostsearch/?q={domain}",
@@ -978,6 +1032,202 @@ async def check_dns_intel(domain: str, client: httpx.AsyncClient) -> dict:
         return results
     except Exception as e:
         return {"error": str(e)}
+
+
+async def check_certificate_transparency(domain: str, client: httpx.AsyncClient) -> dict:
+    """Check crt.sh for certificate history — mass cert issuance = scam signal."""
+    try:
+        r = await client.get(
+            f"https://crt.sh/?q=%.{domain}&output=json",
+            timeout=10,
+            headers={"User-Agent": "Signum/1.0"},
+        )
+        if r.status_code != 200:
+            return {"error": f"crt.sh status {r.status_code}"}
+        data = r.json()
+        total_certs = len(data)
+
+        # Get unique subdomains from certs
+        subdomains = set()
+        suspicious_subs = []
+        SUSPICIOUS_PREFIXES = ["login", "secure", "verify", "account", "signin",
+                               "update", "confirm", "support", "bank", "pay"]
+        for entry in data[:200]:
+            name = entry.get("name_value", "").lower()
+            for line in name.split("\n"):
+                line = line.strip().lstrip("*.")
+                if line and line != domain:
+                    subdomains.add(line)
+                    sub_prefix = line.split(".")[0]
+                    if sub_prefix in SUSPICIOUS_PREFIXES:
+                        suspicious_subs.append(line)
+
+        # Earliest cert date
+        earliest = None
+        try:
+            dates = [e.get("not_before", "") for e in data if e.get("not_before")]
+            if dates:
+                dates.sort()
+                earliest = dates[0][:10]
+        except Exception:
+            pass
+
+        # Many certs in short time = automated scam farm
+        recent_certs = 0
+        try:
+            from datetime import timedelta
+            cutoff = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
+            recent_certs = sum(1 for e in data if e.get("not_before", "") >= cutoff)
+        except Exception:
+            pass
+
+        return {
+            "total_certs": total_certs,
+            "unique_subdomains": len(subdomains),
+            "suspicious_subdomains": suspicious_subs[:5],
+            "has_suspicious_subdomains": len(suspicious_subs) > 0,
+            "earliest_cert": earliest,
+            "recent_certs_30d": recent_certs,
+            "mass_cert_issuance": recent_certs > 10,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_payment_page(domain: str, client: httpx.AsyncClient) -> dict:
+    """Detect if site has payment/checkout forms — critical for scam assessment."""
+    import re as _re
+    try:
+        # Check homepage + common checkout URLs
+        urls_to_check = [f"https://{domain}", f"https://{domain}/checkout",
+                         f"https://{domain}/cart", f"https://{domain}/payment"]
+        payment_signals = []
+        has_payment_form = False
+
+        for url in urls_to_check[:2]:  # limit to 2 to keep it fast
+            try:
+                r = await client.get(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=7,
+                    follow_redirects=True,
+                )
+                html = r.text[:30000].lower()
+
+                # Credit card field detection
+                cc_patterns = [
+                    r'card.?number', r'credit.?card', r'cvv', r'cvc', r'expiry',
+                    r'card-element', r'stripe', r'braintree', r'square\.com',
+                    r'type=["\']?credit', r'autocomplete=["\']?cc-number',
+                ]
+                for pat in cc_patterns:
+                    if _re.search(pat, html):
+                        has_payment_form = True
+                        payment_signals.append(pat.replace(r'["\']?', '').replace(r'\.', '.'))
+                        break
+
+                # Crypto payment detection
+                crypto_patterns = ["bitcoin", "btc address", "eth address", "usdt", "send crypto",
+                                   "wallet address", "trc20", "bep20"]
+                for pat in crypto_patterns:
+                    if pat in html:
+                        payment_signals.append(f"crypto:{pat}")
+                        has_payment_form = True
+                        break
+
+                if has_payment_form:
+                    break
+            except Exception:
+                continue
+
+        return {
+            "has_payment_form": has_payment_form,
+            "payment_signals": list(set(payment_signals))[:5],
+            "requests_crypto": any("crypto:" in s for s in payment_signals),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_tech_fingerprint(domain: str, client: httpx.AsyncClient) -> dict:
+    """Detect technologies used — scam sites have characteristic tech stacks."""
+    import re as _re
+    try:
+        r = await client.get(
+            f"https://{domain}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=8,
+            follow_redirects=True,
+        )
+        html = r.text[:40000].lower()
+        headers = {k.lower(): v.lower() for k, v in r.headers.items()}
+
+        techs = []
+        # CMS detection
+        if "wp-content" in html or "wp-includes" in html: techs.append("WordPress")
+        if "shopify" in html or "cdn.shopify" in html: techs.append("Shopify")
+        if "opencart" in html: techs.append("OpenCart")
+        if "prestashop" in html: techs.append("PrestaShop")
+        if "woocommerce" in html: techs.append("WooCommerce")
+        if "magento" in html: techs.append("Magento")
+        if "squarespace" in html: techs.append("Squarespace")
+        if "wix.com" in html: techs.append("Wix")
+        if "webflow" in html: techs.append("Webflow")
+
+        # Analytics — absence is suspicious for a real business
+        has_analytics = any(p in html for p in [
+            "google-analytics", "gtag", "googletagmanager", "ga.js",
+            "hotjar", "mixpanel", "segment", "plausible", "matomo"
+        ])
+
+        # Live chat — legitimate businesses often have it
+        has_chat = any(p in html for p in [
+            "intercom", "zendesk", "tawkto", "tawk.to", "crisp.chat",
+            "freshdesk", "hubspot", "drift", "livechat"
+        ])
+
+        # Server header
+        server = headers.get("server", "unknown")
+        powered_by = headers.get("x-powered-by", "")
+
+        # No-index meta — hiding from search engines
+        hides_from_search = bool(_re.search(r'<meta[^>]+noindex', html))
+
+        return {
+            "technologies": techs,
+            "has_analytics": has_analytics,
+            "has_live_chat": has_chat,
+            "hides_from_search": hides_from_search,
+            "server": server[:50],
+            "powered_by": powered_by[:50],
+            "no_analytics_no_chat": not has_analytics and not has_chat,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def check_ip_neighbourhood(domain: str, client: httpx.AsyncClient) -> dict:
+    """Check how many sites share the same IP — scam farms host many sites per IP."""
+    try:
+        loop = asyncio.get_event_loop()
+        ip = await loop.run_in_executor(None, lambda: socket.gethostbyname(domain))
+        r = await client.get(
+            f"https://api.hackertarget.com/reverseiplookup/?q={ip}",
+            timeout=8,
+        )
+        if r.status_code == 200 and "error" not in r.text.lower():
+            neighbours = [h.strip() for h in r.text.strip().splitlines() if h.strip()]
+            return {
+                "ip": ip,
+                "shared_hosting_count": len(neighbours),
+                "neighbours_sample": neighbours[:5],
+                "scam_farm_risk": len(neighbours) > 50,
+                "high_density": len(neighbours) > 20,
+            }
+        return {"ip": ip, "shared_hosting_count": 0}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 
 async def scrape_homepage_content(domain: str, client: httpx.AsyncClient) -> dict:
@@ -1106,6 +1356,65 @@ async def check_social_presence(domain: str, client: httpx.AsyncClient) -> dict:
     }
 
 
+async def analyze_screenshot_with_claude(domain: str, screenshot_url: str) -> dict:
+    """Use Claude Vision to detect visual brand impersonation in screenshots."""
+    if not screenshot_url or not ANTHROPIC_KEY:
+        return {"skipped": True}
+    try:
+        async with httpx.AsyncClient() as client:
+            img_r = await client.get(screenshot_url, timeout=10)
+            if img_r.status_code != 200:
+                return {"error": "Could not fetch screenshot"}
+            import base64 as _b64
+            img_b64 = _b64.b64encode(img_r.content).decode()
+            content_type = img_r.headers.get("content-type", "image/png").split(";")[0]
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 300,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": content_type, "data": img_b64}
+                            },
+                            {
+                                "type": "text",
+                                "text": f"""This is a screenshot of {domain}. Reply ONLY with valid JSON, no markdown:
+{{
+  "impersonates_brand": true/false,
+  "impersonated_brand": "<brand name or null>",
+  "looks_professional": true/false,
+  "has_red_flags": true/false,
+  "red_flags": ["<visual red flags>"],
+  "visual_summary": "<one sentence>"
+}}
+Look for: logos/colors copying known brands, fake trust badges, unprofessional design, urgency banners, suspicious popups."""
+                            }
+                        ]
+                    }]
+                },
+                timeout=20,
+            )
+            data = r.json()
+            text = data.get("content", [{}])[0].get("text", "{}")
+            import json as _json
+            try:
+                clean = text.strip().replace("```json", "").replace("```", "").strip()
+                return _json.loads(clean)
+            except Exception:
+                return {"visual_summary": text[:200]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CLAUDE SYNTHESIS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1167,7 +1476,13 @@ IMPORTANT DISTINCTIONS:
 - homepage_analysis.redirect_count > 2 is suspicious. domain_changed=true means the site redirects to a completely different domain — major red flag.
 - brand_similarity.typosquatting_detected=true means domain closely resembles a major brand (e.g. paypa1.com vs paypal.com) — treat as HIGH RISK immediately.
 - social_presence.no_social_presence=true for a business site means zero Twitter/LinkedIn/Facebook — notable CAUTION signal. Legitimate businesses almost always have some social presence.
-- If homepage_text_sample is empty or has error, note that the site may be blocking crawlers — treat as mild CAUTION."""
+- If homepage_text_sample is empty or has error, note that the site may be blocking crawlers — treat as mild CAUTION.
+- dns_data: no_email_server=true means no MX records — a "business" with no email infrastructure is suspicious. poor_email_security=true (no SPF/DMARC) means the domain could be used for phishing. uses_free_email=true (Gmail/Yahoo MX) for a supposed business is a red flag. suspicious_ns=true means the domain uses nameservers associated with high-abuse registrars.
+- certificate_transparency: has_suspicious_subdomains=true means certs issued for subdomains like login., verify., account. — classic phishing infrastructure. mass_issuance=true (20+ certs) = automated scam farm operation. no_cert_history=true on a site claiming to be established = suspicious.
+- payment_detection: high_risk_payment_method=true (crypto/gift cards/wire transfer) is a very strong scam signal. payment_without_processor=true (has checkout but no Stripe/PayPal) on a suspicious site = direct financial risk — highlight prominently.
+- tech_fingerprint: pirated_theme=true is a direct scam signal. no_analytics and no known CMS on a supposed business site is suspicious. has_csp and has_hsts are positive security signals.
+- ip_neighbourhood: shared_hosting_risk=true (50+ sites on same IP) suggests scam farm infrastructure.
+- visual_analysis: if impersonates_brand=true, this is extremely high risk — the site is visually copying a known brand. Always mention this prominently in findings and narrative. red_flags list contains specific visual issues found."""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -1201,7 +1516,7 @@ def is_trusted_infra(domain: str) -> str | None:
             return infra
     return None
 
-def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_data: dict, ipqs_data: dict = None, brand_data: dict = None, homepage_data: dict = None) -> tuple[int, str]:
+def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_data: dict, ipqs_data: dict = None, brand_data: dict = None, homepage_data: dict = None, dns_data: dict = None, cert_data: dict = None, payment_data: dict = None, ip_data: dict = None) -> tuple[int, str]:
     """Deterministic scoring formula. Returns (score, confidence)."""
     score = 30  # neutral baseline
     data_points = 0
@@ -1296,6 +1611,38 @@ def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_da
             score += 20
         if homepage_data.get("ssl_very_new"):
             score += 10
+
+    # DNS signals
+    if isinstance(dns_data, dict) and not dns_data.get("error"):
+        data_points += 1
+        if dns_data.get("poor_email_security") and not dns_data.get("has_mx"):
+            score += 10  # no email infrastructure at all
+        if dns_data.get("suspicious_ns"):
+            score += 8
+        if dns_data.get("uses_free_email"):
+            score += 5  # business using Gmail/Yahoo MX
+
+    # Certificate Transparency
+    if isinstance(cert_data, dict) and not cert_data.get("error"):
+        data_points += 1
+        if cert_data.get("has_suspicious_subdomains"):
+            score += 20  # login., verify., secure. subdomains
+        if cert_data.get("mass_cert_issuance"):
+            score += 15  # 10+ certs in 30 days = automated farm
+
+    # Payment + crypto
+    if isinstance(payment_data, dict) and not payment_data.get("error"):
+        if payment_data.get("requests_crypto"):
+            score += 30  # crypto payment = very high risk
+        elif payment_data.get("has_payment_form"):
+            data_points += 1  # has checkout but not crypto — neutral context
+
+    # IP neighbourhood
+    if isinstance(ip_data, dict) and not ip_data.get("error"):
+        if ip_data.get("scam_farm_risk"):
+            score += 20  # 50+ sites on same IP
+        elif ip_data.get("high_density"):
+            score += 8   # 20+ sites
 
     score = max(0, min(100, score))
 
@@ -1927,6 +2274,10 @@ async def investigate(req: InvestigateRequest, request: Request):
                 check_gleif(domain, client),              # 14
                 scrape_homepage_content(domain, client),  # 15
                 check_social_presence(domain, client),    # 16
+                check_certificate_transparency(domain, client),  # 17
+                check_payment_page(domain, client),       # 18
+                check_tech_fingerprint(domain, client),   # 19
+                check_ip_neighbourhood(domain, client),   # 20
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1934,10 +2285,15 @@ async def investigate(req: InvestigateRequest, request: Request):
          trustpilot_data, wayback_data, shodan_data,
          ipqs_data, abuseipdb_data, otx_data, dns_data,
          companies_house_data, sec_edgar_data, gleif_data,
-         homepage_data, social_data) = results
+         homepage_data, social_data, cert_data, payment_data,
+         tech_data, ip_neighbourhood_data) = results
 
         # Brand similarity check (CPU-only, no HTTP)
         brand_data = await check_brand_similarity(domain)
+
+        # Screenshot visual analysis via Claude Vision
+        screenshot_url = urlscan_data.get("screenshot_url", "") if isinstance(urlscan_data, dict) else ""
+        visual_data = await analyze_screenshot_with_claude(domain, screenshot_url) if screenshot_url else {"skipped": True}
 
         logger.info(f"Data collected. WHOIS: {whois_data}, VT: {vt_data}, GSB: {gsb_data}")
 
@@ -1962,6 +2318,11 @@ async def investigate(req: InvestigateRequest, request: Request):
             "homepage_text_sample": (homepage_data.get("homepage_text", "")[:1500] if isinstance(homepage_data, dict) else ""),
             "brand_similarity": brand_data,
             "social_presence": social_data,
+            "certificate_transparency": cert_data,
+            "payment_detection": payment_data,
+            "tech_fingerprint": tech_data,
+            "ip_neighbourhood": ip_neighbourhood_data,
+            "visual_analysis": visual_data,
         }
 
         # ── Calculate base score deterministically ───────────────────────
@@ -1969,6 +2330,10 @@ async def investigate(req: InvestigateRequest, request: Request):
             vt_data, gsb_data, whois_data, ssl_data, ipqs_data,
             brand_data=brand_data,
             homepage_data=homepage_data if isinstance(homepage_data, dict) else None,
+            dns_data=dns_data if isinstance(dns_data, dict) else None,
+            cert_data=cert_data if isinstance(cert_data, dict) else None,
+            payment_data=payment_data if isinstance(payment_data, dict) else None,
+            ip_data=ip_neighbourhood_data if isinstance(ip_neighbourhood_data, dict) else None,
         )
         all_intelligence["base_score"] = base_score
         all_intelligence["data_confidence"] = data_confidence
