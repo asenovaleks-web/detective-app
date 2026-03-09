@@ -4454,6 +4454,24 @@ async def analyze_email_header(req: EmailHeaderRequest):
                     "text": f"Return-Path mismatch: Email claims to be from {fd} but bounces go to {rd}. Indicates email spoofing."
                 })
 
+    # ── Free email provider detection ────────────────────────────────────
+    FREE_PROVIDERS = ["gmail.com", "yahoo.com", "yahoo.co.uk", "hotmail.com",
+                      "outlook.com", "live.com", "icloud.com", "protonmail.com",
+                      "proton.me", "aol.com", "mail.com", "yandex.com", "zoho.com"]
+    is_free_provider = False
+    from_provider = None
+    if from_addr:
+        fm = _re.search(r"@([\w.-]+)", from_addr)
+        if fm:
+            from_provider = fm.group(1).lower()
+            is_free_provider = from_provider in FREE_PROVIDERS
+
+    if is_free_provider:
+        findings.append({
+            "icon": "ℹ️", "tag": "CAUTION",
+            "text": f"Sent from a personal {from_provider} account, not a business domain. Legitimate companies typically use their own domain (e.g. @company.com). This alone isn't a red flag, but verify the sender independently."
+        })
+
     # ── SPF ──────────────────────────────────────────────────────────────
     if spf_result:
         spf_lower = spf_result.lower()
@@ -4466,7 +4484,8 @@ async def analyze_email_header(req: EmailHeaderRequest):
         elif spf_lower == "none":
             risk_signals.append({"icon": "⚠️", "tag": "CAUTION", "text": "No SPF record — the sending domain has no email authentication policy."})
     else:
-        findings.append({"icon": "⚠️", "tag": "CAUTION", "text": "SPF result not found in headers — authentication status unknown."})
+        if not is_free_provider:
+            findings.append({"icon": "⚠️", "tag": "CAUTION", "text": "SPF result not found in headers — authentication status unknown."})
 
     # ── DKIM ─────────────────────────────────────────────────────────────
     if dkim_result:
@@ -4475,7 +4494,8 @@ async def analyze_email_header(req: EmailHeaderRequest):
         elif dkim_result.lower() in ("fail", "none", "invalid"):
             risk_signals.append({"icon": "🚨", "tag": "RISK", "text": f"DKIM {dkim_result.upper()} — email signature is missing or invalid. Content may have been modified."})
     else:
-        findings.append({"icon": "⚠️", "tag": "CAUTION", "text": "DKIM result not found — cannot verify email integrity."})
+        if not is_free_provider:
+            findings.append({"icon": "⚠️", "tag": "CAUTION", "text": "DKIM result not found — cannot verify email integrity."})
 
     # ── DMARC ────────────────────────────────────────────────────────────
     if dmarc_result:
@@ -4484,7 +4504,8 @@ async def analyze_email_header(req: EmailHeaderRequest):
         elif dmarc_result.lower() in ("fail", "none"):
             risk_signals.append({"icon": "🚨", "tag": "RISK", "text": f"DMARC {dmarc_result.upper()} — email failed domain alignment check. High risk of spoofing."})
     else:
-        findings.append({"icon": "⚠️", "tag": "CAUTION", "text": "DMARC result not found in headers."})
+        if not is_free_provider:
+            findings.append({"icon": "⚠️", "tag": "CAUTION", "text": "DMARC result not found in headers."})
 
     # ── Suspicious routing ───────────────────────────────────────────────
     if hop_count > 8:
