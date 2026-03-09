@@ -2325,6 +2325,35 @@ async def report_site(req: SiteReportRequest, authorization: str = Header(None))
             except Exception as db_err:
                 logger.warning(f"Supabase site_reports insert failed (table may not exist yet): {db_err}")
 
+        # Submit to AbuseIPDB
+        if ABUSEIPDB_KEY:
+            try:
+                abuseipdb_categories = {
+                    "phishing": "14",
+                    "fake_shop": "14,20",
+                    "scam": "20",
+                    "malware": "14,21",
+                    "other": "20",
+                }
+                cat_ids = abuseipdb_categories.get(req.category, "20")
+                comment = f"Reported via Signum AI (signumaiapp.com) as {cat_label}."
+                if req.details:
+                    comment += f" Details: {req.details[:200]}"
+                async with httpx.AsyncClient() as client:
+                    ab_resp = await client.post(
+                        "https://api.abuseipdb.com/api/v2/report",
+                        headers={"Key": ABUSEIPDB_KEY, "Accept": "application/json"},
+                        data={
+                            "ip": req.domain,
+                            "categories": cat_ids,
+                            "comment": comment,
+                        },
+                        timeout=10,
+                    )
+                    logger.info(f"AbuseIPDB report: {ab_resp.status_code} for {req.domain}")
+            except Exception as ab_err:
+                logger.warning(f"AbuseIPDB report failed: {ab_err}")
+
         # Email notification
         RESEND_KEY = _env.get("RESEND_API_KEY", "")
         if RESEND_KEY:
@@ -2360,6 +2389,30 @@ async def report_site(req: SiteReportRequest, authorization: str = Header(None))
         logger.error(f"Report site error: {e}")
         return {"ok": False, "error": str(e)}
 
+
+@app.get("/report-count")
+async def report_count(domain: str):
+    """Return the number of user reports for a domain."""
+    if not domain:
+        return {"count": 0}
+    clean = domain.lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0].strip()
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/site_reports",
+                headers={
+                    "apikey": SUPABASE_SERVICE,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                },
+                params={"domain": f"eq.{clean}", "select": "id"},
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return {"count": len(data), "domain": clean}
+    except Exception as e:
+        logger.warning(f"report-count error: {e}")
+    return {"count": 0, "domain": clean}
 
 
 class ContactRequest(BaseModel):
