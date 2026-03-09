@@ -401,17 +401,58 @@ async def check_ssl_info(domain: str, client: httpx.AsyncClient) -> dict:
         issuer = dict(x[0] for x in cert.get("issuer", []))
         subject = dict(x[0] for x in cert.get("subject", []))
         not_after = cert.get("notAfter", "")
+        not_before = cert.get("notBefore", "")
+
         days_remaining = None
         if not_after:
             days_remaining = (datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z") - datetime.utcnow()).days
+
+        issued_days_ago = None
+        ssl_age_days = None
+        if not_before:
+            issued_dt = datetime.strptime(not_before, "%b %d %H:%M:%S %Y %Z")
+            issued_days_ago = (datetime.utcnow() - issued_dt).days
+            ssl_age_days = issued_days_ago
+
+        issuer_org = issuer.get("organizationName", issuer.get("commonName", "Unknown"))
+        issued_to = subject.get("commonName", domain)
+
+        # Classify issuer trust level
+        FREE_CAS = ["let's encrypt", "zerossl", "buypass", "ssl.com free"]
+        TRUSTED_CAS = ["digicert", "comodo", "sectigo", "globalsign", "entrust", "godaddy",
+                       "geotrust", "thawte", "verisign", "amazon", "google trust"]
+        issuer_lower = issuer_org.lower()
+        is_free_ca = any(ca in issuer_lower for ca in FREE_CAS)
+        is_trusted_ca = any(ca in issuer_lower for ca in TRUSTED_CAS)
+        is_self_signed = issuer.get("commonName") == subject.get("commonName")
+
+        # Check domain mismatch — cert issued to wildcard or different domain
+        domain_mismatch = False
+        if issued_to and not issued_to.startswith("*"):
+            issued_clean = issued_to.replace("www.", "")
+            domain_clean = domain.replace("www.", "")
+            domain_mismatch = issued_clean != domain_clean
+
+        # Short validity = auto-renewed free cert (normal) vs very new (suspicious if combined with new domain)
+        short_validity = days_remaining is not None and (days_remaining + (issued_days_ago or 0)) <= 90
+
         return {
             "has_ssl": True,
-            "issuer": issuer.get("organizationName", issuer.get("commonName", "Unknown")),
-            "issued_to": subject.get("commonName", domain),
+            "issuer": issuer_org,
+            "issued_to": issued_to,
             "not_after": not_after,
+            "not_before": not_before,
             "days_remaining": days_remaining,
+            "issued_days_ago": issued_days_ago,
+            "ssl_age_days": ssl_age_days,
             "expired": days_remaining < 0 if days_remaining is not None else False,
-            "self_signed": issuer.get("commonName") == subject.get("commonName"),
+            "self_signed": is_self_signed,
+            "is_free_ca": is_free_ca,
+            "is_trusted_ca": is_trusted_ca,
+            "domain_mismatch": domain_mismatch,
+            "short_validity": short_validity,
+            "ssl_very_new": issued_days_ago is not None and issued_days_ago < 14,
+            "ssl_new": issued_days_ago is not None and issued_days_ago < 30,
         }
     except ssl.SSLCertVerificationError as e:
         return {"has_ssl": True, "error": f"SSL verification failed: {str(e)}", "self_signed": True}
@@ -1120,9 +1161,10 @@ IMPORTANT DISTINCTIONS:
 - If AbuseIPDB abuse_confidence_score > 50 or total_reports > 5, treat as RISK signal.
 - If OTX pulse_count > 3, treat as CAUTION or RISK depending on threat names.
 - Screenshot available in urlscan.screenshot_url — mention it exists in narrative if found.
-- homepage_text_sample contains the actual text from the site's homepage. Analyze it for: urgency language ("limited time", "act now"), unrealistic promises, poor grammar/spelling, missing contact info, aggressive sales tactics. These are strong scam signals.
+- SSL details: domain_mismatch=true means the certificate was not issued for this domain — HIGH RISK. self_signed=true is suspicious for public sites. is_trusted_ca=true (DigiCert, Comodo, etc.) is a positive signal — these cost money and require identity verification. ssl_very_new=true (< 14 days) combined with a new domain is a strong scam signal. is_free_ca alone (Let's Encrypt) is NEUTRAL — most legitimate sites use it.
+- Wayback Machine: if first_seen_age_days < 60 and no snapshot found, the site has almost no internet history — notable CAUTION. If first_seen_age_days > 1000, site has long history — positive signal.
+- homepage_text_sample contains the actual text from the site's homepage. Analyze it for: urgency language ("limited time", "act now"), unrealistic promises ("guaranteed returns", "100% profit"), poor grammar/spelling, missing contact info, aggressive sales tactics, fake testimonials. These are strong scam signals.
 - homepage_analysis.redirect_count > 2 is suspicious. domain_changed=true means the site redirects to a completely different domain — major red flag.
-- homepage_analysis.ssl_very_new=true means SSL cert issued less than 14 days ago — strong scam signal combined with new domain.
 - brand_similarity.typosquatting_detected=true means domain closely resembles a major brand (e.g. paypa1.com vs paypal.com) — treat as HIGH RISK immediately.
 - social_presence.no_social_presence=true for a business site means zero Twitter/LinkedIn/Facebook — notable CAUTION signal. Legitimate businesses almost always have some social presence.
 - If homepage_text_sample is empty or has error, note that the site may be blocking crawlers — treat as mild CAUTION."""
@@ -1199,13 +1241,23 @@ def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_da
         if whois_data.get("privacy_protected"):
             score += 5
 
-    # SSL
+    # SSL — enhanced scoring
     if isinstance(ssl_data, dict):
         data_points += 1
-        if ssl_data.get("valid") is False:
+        if not ssl_data.get("has_ssl"):
+            score += 25  # no SSL at all
+        elif ssl_data.get("expired"):
             score += 20
-        elif ssl_data.get("valid") is True:
-            score -= 5
+        elif ssl_data.get("self_signed"):
+            score += 20
+        elif ssl_data.get("domain_mismatch"):
+            score += 25  # cert not issued for this domain
+        elif ssl_data.get("ssl_very_new"):
+            score += 12  # cert < 14 days old
+        elif ssl_data.get("is_trusted_ca"):
+            score -= 8   # paid CA = more legit
+        if ssl_data.get("is_free_ca") and not ssl_data.get("ssl_very_new"):
+            pass  # free CA alone is neutral — very common
 
     # IPQS — strongest signal, worth most data points
     if isinstance(ipqs_data, dict) and not ipqs_data.get("error"):
