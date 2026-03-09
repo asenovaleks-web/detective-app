@@ -4368,6 +4368,228 @@ async def watchlist_rescan_cron():
 
 
 
+
+
+class EmailHeaderRequest(BaseModel):
+    raw_header: str
+
+@app.post("/analyze-email-header")
+async def analyze_email_header(req: EmailHeaderRequest):
+    """Parse and analyze email headers for phishing/spoofing signals."""
+    import re as _re
+
+    raw = req.raw_header.strip()
+    if not raw or len(raw) < 20:
+        raise HTTPException(status_code=400, detail="No header provided")
+    if len(raw) > 50000:
+        raise HTTPException(status_code=400, detail="Header too long")
+
+    findings = []
+    risk_signals = []
+    safe_signals = []
+
+    # ── Parse key headers ────────────────────────────────────────────────
+    def extract(pattern, text, flags=_re.IGNORECASE | _re.MULTILINE):
+        m = _re.search(pattern, text, flags)
+        return m.group(1).strip() if m else None
+
+    from_addr    = extract(r"^From:\s*(.+)$", raw)
+    reply_to     = extract(r"^Reply-To:\s*(.+)$", raw)
+    return_path  = extract(r"^Return-Path:\s*<(.+?)>", raw)
+    subject      = extract(r"^Subject:\s*(.+)$", raw)
+    msg_id       = extract(r"^Message-ID:\s*(.+)$", raw)
+    date_str     = extract(r"^Date:\s*(.+)$", raw)
+
+    # SPF
+    spf_result   = extract(r"spf=(\w+)", raw)
+    # DKIM
+    dkim_result  = extract(r"dkim=(\w+)", raw)
+    # DMARC
+    dmarc_result = extract(r"dmarc=(\w+)", raw)
+    # ARC
+    arc_result   = extract(r"arc=(\w+)", raw)
+
+    # Received hops
+    received_hops = _re.findall(r"^Received:", raw, _re.IGNORECASE | _re.MULTILINE)
+    hop_count = len(received_hops)
+
+    # Extract all IPs from Received headers
+    ips_in_received = _re.findall(
+        r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+        " ".join(_re.findall(r"^Received:.+$", raw, _re.IGNORECASE | _re.MULTILINE))
+    )
+    # Filter private IPs
+    def is_public_ip(ip):
+        parts = list(map(int, ip.split(".")))
+        if parts[0] == 10: return False
+        if parts[0] == 172 and 16 <= parts[1] <= 31: return False
+        if parts[0] == 192 and parts[1] == 168: return False
+        if parts[0] == 127: return False
+        return True
+    public_ips = list(dict.fromkeys([ip for ip in ips_in_received if is_public_ip(ip)]))
+
+    # ── From vs Reply-To mismatch ────────────────────────────────────────
+    if from_addr and reply_to:
+        from_domain = _re.search(r"@([\w.-]+)", from_addr)
+        reply_domain = _re.search(r"@([\w.-]+)", reply_to)
+        if from_domain and reply_domain:
+            fd = from_domain.group(1).lower()
+            rd = reply_domain.group(1).lower()
+            if fd != rd:
+                risk_signals.append({
+                    "icon": "⚠️", "tag": "RISK",
+                    "text": f"Reply-To mismatch: From domain is {fd} but replies go to {rd}. Classic phishing trick to intercept your response."
+                })
+
+    # ── From vs Return-Path mismatch ─────────────────────────────────────
+    if from_addr and return_path:
+        from_domain = _re.search(r"@([\w.-]+)", from_addr)
+        rp_domain = _re.search(r"@([\w.-]+)", return_path)
+        if from_domain and rp_domain:
+            fd = from_domain.group(1).lower()
+            rd = rp_domain.group(1).lower()
+            if fd != rd:
+                risk_signals.append({
+                    "icon": "⚠️", "tag": "RISK",
+                    "text": f"Return-Path mismatch: Email claims to be from {fd} but bounces go to {rd}. Indicates email spoofing."
+                })
+
+    # ── SPF ──────────────────────────────────────────────────────────────
+    if spf_result:
+        spf_lower = spf_result.lower()
+        if spf_lower == "pass":
+            safe_signals.append({"icon": "✅", "tag": "OK", "text": f"SPF passed — the sending server is authorized to send email for this domain."})
+        elif spf_lower in ("fail", "softfail"):
+            risk_signals.append({"icon": "🚨", "tag": "RISK", "text": f"SPF {spf_result.upper()} — this email was NOT sent from an authorized server. Strong spoofing indicator."})
+        elif spf_lower == "neutral":
+            findings.append({"icon": "⚠️", "tag": "CAUTION", "text": "SPF neutral — domain owner hasn't specified authorized senders. Email authenticity unverified."})
+        elif spf_lower == "none":
+            risk_signals.append({"icon": "⚠️", "tag": "CAUTION", "text": "No SPF record — the sending domain has no email authentication policy."})
+    else:
+        findings.append({"icon": "⚠️", "tag": "CAUTION", "text": "SPF result not found in headers — authentication status unknown."})
+
+    # ── DKIM ─────────────────────────────────────────────────────────────
+    if dkim_result:
+        if dkim_result.lower() == "pass":
+            safe_signals.append({"icon": "✅", "tag": "OK", "text": "DKIM passed — email content has not been tampered with in transit."})
+        elif dkim_result.lower() in ("fail", "none", "invalid"):
+            risk_signals.append({"icon": "🚨", "tag": "RISK", "text": f"DKIM {dkim_result.upper()} — email signature is missing or invalid. Content may have been modified."})
+    else:
+        findings.append({"icon": "⚠️", "tag": "CAUTION", "text": "DKIM result not found — cannot verify email integrity."})
+
+    # ── DMARC ────────────────────────────────────────────────────────────
+    if dmarc_result:
+        if dmarc_result.lower() == "pass":
+            safe_signals.append({"icon": "✅", "tag": "OK", "text": "DMARC passed — email aligns with domain's authentication policy."})
+        elif dmarc_result.lower() in ("fail", "none"):
+            risk_signals.append({"icon": "🚨", "tag": "RISK", "text": f"DMARC {dmarc_result.upper()} — email failed domain alignment check. High risk of spoofing."})
+    else:
+        findings.append({"icon": "⚠️", "tag": "CAUTION", "text": "DMARC result not found in headers."})
+
+    # ── Suspicious routing ───────────────────────────────────────────────
+    if hop_count > 8:
+        risk_signals.append({"icon": "⚠️", "tag": "CAUTION", "text": f"Unusual routing: {hop_count} hops detected. Legitimate emails rarely pass through this many servers."})
+    elif hop_count > 0:
+        safe_signals.append({"icon": "✅", "tag": "OK", "text": f"Normal routing: {hop_count} server hop{'s' if hop_count != 1 else ''} detected."})
+
+    # ── Known spam infrastructure IPs ────────────────────────────────────
+    SUSPICIOUS_RANGES = ["185.220.", "194.165.", "91.108.", "45.142.", "185.234."]
+    for ip in public_ips:
+        for r in SUSPICIOUS_RANGES:
+            if ip.startswith(r):
+                risk_signals.append({"icon": "🚨", "tag": "RISK", "text": f"Suspicious IP detected in routing: {ip} — associated with known spam/malware infrastructure."})
+                break
+
+    # ── Urgent/scam subject line keywords ───────────────────────────────
+    if subject:
+        URGENT_KEYWORDS = ["urgent", "verify your", "account suspended", "immediate action",
+                          "winner", "you have won", "claim your", "confirm your identity",
+                          "unusual activity", "security alert", "limited time", "act now",
+                          "click here", "password expired", "invoice attached", "payment required"]
+        subj_lower = subject.lower()
+        matched = [kw for kw in URGENT_KEYWORDS if kw in subj_lower]
+        if matched:
+            risk_signals.append({"icon": "⚠️", "tag": "CAUTION", "text": f"Subject line uses high-pressure language: \"{subject[:80]}\" — common in phishing emails."})
+
+    # ── Suspicious Message-ID ─────────────────────────────────────────────
+    if msg_id:
+        if not "@" in msg_id:
+            risk_signals.append({"icon": "⚠️", "tag": "CAUTION", "text": "Malformed Message-ID — missing domain part. Legitimate mail servers always include it."})
+
+    # ── Build verdict ────────────────────────────────────────────────────
+    all_findings = risk_signals + findings + safe_signals
+    risk_count = len(risk_signals)
+
+    if risk_count >= 3:
+        verdict = "HIGH RISK"
+        verdict_color = "red"
+        summary = "Multiple spoofing and phishing signals detected. Do not click any links or reply to this email."
+    elif risk_count >= 1:
+        verdict = "SUSPICIOUS"
+        verdict_color = "yellow"
+        summary = "This email has authentication issues. Verify the sender independently before taking any action."
+    elif len(safe_signals) >= 2:
+        verdict = "LIKELY LEGITIMATE"
+        verdict_color = "green"
+        summary = "Email authentication checks passed. No major red flags detected."
+    else:
+        verdict = "INCONCLUSIVE"
+        verdict_color = "yellow"
+        summary = "Not enough authentication data to make a confident determination. Proceed with caution."
+
+    # ── AI narrative via Claude ──────────────────────────────────────────
+    narrative = ""
+    if ANTHROPIC_KEY:
+        try:
+            parsed_summary = {
+                "from": from_addr, "reply_to": reply_to, "return_path": return_path,
+                "subject": subject, "spf": spf_result, "dkim": dkim_result,
+                "dmarc": dmarc_result, "hops": hop_count, "public_ips": public_ips[:3],
+                "risk_signals": [f["text"] for f in risk_signals],
+                "safe_signals": [f["text"] for f in safe_signals],
+            }
+            async with httpx.AsyncClient() as cl:
+                r = await cl.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 300,
+                        "messages": [{"role": "user", "content": f"""You are a cybersecurity expert explaining an email header analysis to a non-technical person.
+
+Parsed data: {parsed_summary}
+
+Write 2-3 sentences in plain English explaining what this email header reveals, whether they should trust this email, and what to do. Be direct and clear. No jargon. No bullet points. Max 60 words."""}]
+                    },
+                    timeout=15,
+                )
+                narrative = r.json().get("content", [{}])[0].get("text", "").strip()
+        except Exception:
+            pass
+
+    return {
+        "verdict": verdict,
+        "verdict_color": verdict_color,
+        "summary": summary,
+        "narrative": narrative,
+        "findings": all_findings,
+        "parsed": {
+            "from": from_addr,
+            "reply_to": reply_to,
+            "return_path": return_path,
+            "subject": subject,
+            "spf": spf_result,
+            "dkim": dkim_result,
+            "dmarc": dmarc_result,
+            "arc": arc_result,
+            "hops": hop_count,
+            "public_ips": public_ips[:5],
+            "message_id": msg_id,
+        },
+        "risk_count": risk_count,
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
