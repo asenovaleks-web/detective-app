@@ -938,6 +938,133 @@ async def check_dns_intel(domain: str, client: httpx.AsyncClient) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
+
+async def scrape_homepage_content(domain: str, client: httpx.AsyncClient) -> dict:
+    """Scrape homepage text and analyze for scam signals."""
+    try:
+        url = f"https://{domain}"
+        r = await client.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=10,
+            follow_redirects=True,
+        )
+        # Count redirects
+        redirect_count = len(r.history)
+        final_url = str(r.url)
+        final_domain = final_url.split("/")[2].replace("www.", "") if "//" in final_url else domain
+
+        # Extract text — strip tags crudely but fast
+        import re as _re
+        html = r.text[:50000]  # cap at 50kb
+        text = _re.sub(r"<script[^>]*>[\s\S]*?</script>", " ", html, flags=_re.IGNORECASE)
+        text = _re.sub(r"<style[^>]*>[\s\S]*?</style>", " ", text, flags=_re.IGNORECASE)
+        text = _re.sub(r"<[^>]+>", " ", text)
+        text = _re.sub(r"\s+", " ", text).strip()[:3000]  # first 3000 chars
+
+        # SSL issued_at — get cert not_before
+        ssl_issued_days = None
+        try:
+            import ssl as _ssl
+            ctx = _ssl.create_default_context()
+            loop = asyncio.get_event_loop()
+            def _get_not_before():
+                with socket.create_connection((domain, 443), timeout=5) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=domain) as ssock:
+                        cert = ssock.getpeercert()
+                        nb = cert.get("notBefore", "")
+                        if nb:
+                            from datetime import datetime as _dt
+                            issued = _dt.strptime(nb, "%b %d %H:%M:%S %Y %Z")
+                            return (datetime.utcnow() - issued).days
+            ssl_issued_days = await loop.run_in_executor(None, _get_not_before)
+        except Exception:
+            pass
+
+        return {
+            "homepage_text": text,
+            "redirect_count": redirect_count,
+            "final_domain": final_domain,
+            "domain_changed": final_domain != domain,
+            "ssl_issued_days_ago": ssl_issued_days,
+            "ssl_very_new": ssl_issued_days is not None and ssl_issued_days < 14,
+            "status_code": r.status_code,
+        }
+    except Exception as e:
+        return {"error": str(e), "redirect_count": 0}
+
+
+async def check_brand_similarity(domain: str) -> dict:
+    """Check if domain is typosquatting a major brand."""
+    import re as _re
+    TOP_BRANDS = [
+        "google","facebook","amazon","apple","microsoft","paypal","netflix","instagram",
+        "twitter","linkedin","youtube","whatsapp","telegram","tiktok","snapchat",
+        "ebay","walmart","alibaba","aliexpress","shopify","stripe","coinbase","binance",
+        "blockchain","metamask","trustwallet","chase","barclays","hsbc","wellsfargo",
+        "bankofamerica","citibank","revolut","wise","transferwise","western union",
+        "dhl","fedex","ups","usps","royalmail","amazon","steam","epic","roblox",
+    ]
+    base = _re.sub(r"\.[a-z]{2,}$", "", domain.lower()).replace("-","").replace("_","")
+
+    def levenshtein(a, b):
+        if len(a) < len(b): a, b = b, a
+        if not b: return len(a)
+        prev = list(range(len(b)+1))
+        for i, ca in enumerate(a):
+            curr = [i+1]
+            for j, cb in enumerate(b):
+                curr.append(min(prev[j+1]+1, curr[-1]+1, prev[j]+(ca!=cb)))
+            prev = curr
+        return prev[-1]
+
+    matches = []
+    for brand in TOP_BRANDS:
+        dist = levenshtein(base, brand)
+        similarity = 1 - dist / max(len(base), len(brand))
+        if similarity >= 0.75 and base != brand:
+            matches.append({"brand": brand, "similarity": round(similarity, 2), "distance": dist})
+
+    matches.sort(key=lambda x: -x["similarity"])
+    return {
+        "typosquatting_detected": len(matches) > 0,
+        "matches": matches[:3],
+        "closest_brand": matches[0]["brand"] if matches else None,
+        "closest_similarity": matches[0]["similarity"] if matches else 0,
+    }
+
+
+async def check_social_presence(domain: str, client: httpx.AsyncClient) -> dict:
+    """Check if brand has social media presence — legitimate businesses usually do."""
+    brand = domain.rsplit(".", 1)[0].replace("-", "").replace("_", "")
+    results = {}
+    checks = [
+        ("twitter", f"https://twitter.com/{brand}"),
+        ("linkedin", f"https://www.linkedin.com/company/{brand}"),
+        ("facebook", f"https://www.facebook.com/{brand}"),
+    ]
+    found_count = 0
+    for platform, url in checks:
+        try:
+            r = await client.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=6,
+                follow_redirects=True,
+            )
+            exists = r.status_code == 200 and "not found" not in r.text.lower()[:500]
+            results[platform] = exists
+            if exists:
+                found_count += 1
+        except Exception:
+            results[platform] = False
+    return {
+        "platforms_found": found_count,
+        "details": results,
+        "no_social_presence": found_count == 0,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CLAUDE SYNTHESIS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -992,7 +1119,13 @@ IMPORTANT DISTINCTIONS:
 - If IPQS risk_score > 75 or phishing=true, treat as strong RISK signal.
 - If AbuseIPDB abuse_confidence_score > 50 or total_reports > 5, treat as RISK signal.
 - If OTX pulse_count > 3, treat as CAUTION or RISK depending on threat names.
-- Screenshot available in urlscan.screenshot_url — mention it exists in narrative if found."""
+- Screenshot available in urlscan.screenshot_url — mention it exists in narrative if found.
+- homepage_text_sample contains the actual text from the site's homepage. Analyze it for: urgency language ("limited time", "act now"), unrealistic promises, poor grammar/spelling, missing contact info, aggressive sales tactics. These are strong scam signals.
+- homepage_analysis.redirect_count > 2 is suspicious. domain_changed=true means the site redirects to a completely different domain — major red flag.
+- homepage_analysis.ssl_very_new=true means SSL cert issued less than 14 days ago — strong scam signal combined with new domain.
+- brand_similarity.typosquatting_detected=true means domain closely resembles a major brand (e.g. paypa1.com vs paypal.com) — treat as HIGH RISK immediately.
+- social_presence.no_social_presence=true for a business site means zero Twitter/LinkedIn/Facebook — notable CAUTION signal. Legitimate businesses almost always have some social presence.
+- If homepage_text_sample is empty or has error, note that the site may be blocking crawlers — treat as mild CAUTION."""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -1026,7 +1159,7 @@ def is_trusted_infra(domain: str) -> str | None:
             return infra
     return None
 
-def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_data: dict, ipqs_data: dict = None) -> tuple[int, str]:
+def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_data: dict, ipqs_data: dict = None, brand_data: dict = None, homepage_data: dict = None) -> tuple[int, str]:
     """Deterministic scoring formula. Returns (score, confidence)."""
     score = 30  # neutral baseline
     data_points = 0
@@ -1088,6 +1221,29 @@ def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_da
             score += 15
         elif risk < 20 and ipqs_data.get("domain_rank", 0) > 0:
             score -= 10  # reputable ranked domain
+
+    # Brand similarity — typosquatting is a major red flag
+    if isinstance(brand_data, dict) and brand_data.get("typosquatting_detected"):
+        data_points += 2
+        similarity = brand_data.get("closest_similarity", 0)
+        if similarity >= 0.90:
+            score += 50
+        elif similarity >= 0.80:
+            score += 35
+        else:
+            score += 20
+
+    # Homepage signals
+    if isinstance(homepage_data, dict) and not homepage_data.get("error"):
+        data_points += 1
+        if homepage_data.get("redirect_count", 0) > 3:
+            score += 15
+        elif homepage_data.get("redirect_count", 0) > 1:
+            score += 7
+        if homepage_data.get("domain_changed"):
+            score += 20
+        if homepage_data.get("ssl_very_new"):
+            score += 10
 
     score = max(0, min(100, score))
 
@@ -1717,13 +1873,19 @@ async def investigate(req: InvestigateRequest, request: Request):
                 check_companies_house(domain, client),    # 12
                 check_sec_edgar(domain, client),          # 13
                 check_gleif(domain, client),              # 14
+                scrape_homepage_content(domain, client),  # 15
+                check_social_presence(domain, client),    # 16
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
         (whois_data, vt_data, gsb_data, ssl_data, urlscan_data,
          trustpilot_data, wayback_data, shodan_data,
          ipqs_data, abuseipdb_data, otx_data, dns_data,
-         companies_house_data, sec_edgar_data, gleif_data) = results
+         companies_house_data, sec_edgar_data, gleif_data,
+         homepage_data, social_data) = results
+
+        # Brand similarity check (CPU-only, no HTTP)
+        brand_data = await check_brand_similarity(domain)
 
         logger.info(f"Data collected. WHOIS: {whois_data}, VT: {vt_data}, GSB: {gsb_data}")
 
@@ -1744,11 +1906,17 @@ async def investigate(req: InvestigateRequest, request: Request):
             "abuseipdb": abuseipdb_data,
             "otx_alienvault": otx_data,
             "dns_intelligence": dns_data,
+            "homepage_analysis": {k: v for k, v in (homepage_data if isinstance(homepage_data, dict) else {}).items() if k != "homepage_text"},
+            "homepage_text_sample": (homepage_data.get("homepage_text", "")[:1500] if isinstance(homepage_data, dict) else ""),
+            "brand_similarity": brand_data,
+            "social_presence": social_data,
         }
 
         # ── Calculate base score deterministically ───────────────────────
         base_score, data_confidence = calculate_base_score(
-            vt_data, gsb_data, whois_data, ssl_data, ipqs_data
+            vt_data, gsb_data, whois_data, ssl_data, ipqs_data,
+            brand_data=brand_data,
+            homepage_data=homepage_data if isinstance(homepage_data, dict) else None,
         )
         all_intelligence["base_score"] = base_score
         all_intelligence["data_confidence"] = data_confidence
