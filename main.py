@@ -1098,47 +1098,39 @@ async def check_payment_page(domain: str, client: httpx.AsyncClient) -> dict:
     """Detect if site has payment/checkout forms — critical for scam assessment."""
     import re as _re
     try:
-        # Check homepage + common checkout URLs
-        urls_to_check = [f"https://{domain}", f"https://{domain}/checkout",
-                         f"https://{domain}/cart", f"https://{domain}/payment"]
+        urls_to_check = [f"https://{domain}", f"https://{domain}/checkout"]
         payment_signals = []
         has_payment_form = False
 
-        for url in urls_to_check[:2]:  # limit to 2 to keep it fast
-            try:
-                r = await client.get(
-                    url,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=7,
-                    follow_redirects=True,
-                )
-                html = r.text[:30000].lower()
+        async with httpx.AsyncClient(timeout=7.0, follow_redirects=True) as _c:
+            for url in urls_to_check:
+                try:
+                    r = await _c.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                    html = r.text[:30000].lower()
 
-                # Credit card field detection
-                cc_patterns = [
-                    r'card.?number', r'credit.?card', r'cvv', r'cvc', r'expiry',
-                    r'card-element', r'stripe', r'braintree', r'square\.com',
-                    r'type=["\']?credit', r'autocomplete=["\']?cc-number',
-                ]
-                for pat in cc_patterns:
-                    if _re.search(pat, html):
-                        has_payment_form = True
-                        payment_signals.append(pat.replace(r'["\']?', '').replace(r'\.', '.'))
+                    cc_patterns = [
+                        r'card.?number', r'credit.?card', r'cvv', r'cvc', r'expiry',
+                        r'card-element', r'stripe', r'braintree',
+                        r'type=.?credit', r'autocomplete=.?cc-number',
+                    ]
+                    for pat in cc_patterns:
+                        if _re.search(pat, html):
+                            has_payment_form = True
+                            payment_signals.append(pat[:20])
+                            break
+
+                    crypto_patterns = ["bitcoin", "btc address", "eth address", "usdt",
+                                       "wallet address", "trc20", "bep20"]
+                    for pat in crypto_patterns:
+                        if pat in html:
+                            payment_signals.append(f"crypto:{pat}")
+                            has_payment_form = True
+                            break
+
+                    if has_payment_form:
                         break
-
-                # Crypto payment detection
-                crypto_patterns = ["bitcoin", "btc address", "eth address", "usdt", "send crypto",
-                                   "wallet address", "trc20", "bep20"]
-                for pat in crypto_patterns:
-                    if pat in html:
-                        payment_signals.append(f"crypto:{pat}")
-                        has_payment_form = True
-                        break
-
-                if has_payment_form:
-                    break
-            except Exception:
-                continue
+                except Exception:
+                    continue
 
         return {
             "has_payment_form": has_payment_form,
@@ -1153,12 +1145,8 @@ async def check_tech_fingerprint(domain: str, client: httpx.AsyncClient) -> dict
     """Detect technologies used — scam sites have characteristic tech stacks."""
     import re as _re
     try:
-        r = await client.get(
-            f"https://{domain}",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=8,
-            follow_redirects=True,
-        )
+        async with httpx.AsyncClient(timeout=7.0, follow_redirects=True) as _c:
+            r = await _c.get(f"https://{domain}", headers={"User-Agent": "Mozilla/5.0"})
         html = r.text[:40000].lower()
         headers = {k.lower(): v.lower() for k, v in r.headers.items()}
 
@@ -1234,26 +1222,22 @@ async def scrape_homepage_content(domain: str, client: httpx.AsyncClient) -> dic
     """Scrape homepage text and analyze for scam signals."""
     try:
         url = f"https://{domain}"
-        r = await client.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-            timeout=10,
-            follow_redirects=True,
-        )
-        # Count redirects
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as _c:
+            r = await _c.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            )
         redirect_count = len(r.history)
         final_url = str(r.url)
         final_domain = final_url.split("/")[2].replace("www.", "") if "//" in final_url else domain
 
-        # Extract text — strip tags crudely but fast
         import re as _re
-        html = r.text[:50000]  # cap at 50kb
+        html = r.text[:50000]
         text = _re.sub(r"<script[^>]*>[\s\S]*?</script>", " ", html, flags=_re.IGNORECASE)
         text = _re.sub(r"<style[^>]*>[\s\S]*?</style>", " ", text, flags=_re.IGNORECASE)
         text = _re.sub(r"<[^>]+>", " ", text)
-        text = _re.sub(r"\s+", " ", text).strip()[:3000]  # first 3000 chars
+        text = _re.sub(r"\s+", " ", text).strip()[:3000]
 
-        # SSL issued_at — get cert not_before
         ssl_issued_days = None
         try:
             import ssl as _ssl
@@ -1335,20 +1319,16 @@ async def check_social_presence(domain: str, client: httpx.AsyncClient) -> dict:
         ("facebook", f"https://www.facebook.com/{brand}"),
     ]
     found_count = 0
-    for platform, url in checks:
-        try:
-            r = await client.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=6,
-                follow_redirects=True,
-            )
-            exists = r.status_code == 200 and "not found" not in r.text.lower()[:500]
-            results[platform] = exists
-            if exists:
-                found_count += 1
-        except Exception:
-            results[platform] = False
+    async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as _c:
+        for platform, url in checks:
+            try:
+                r = await _c.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                exists = r.status_code == 200 and "not found" not in r.text.lower()[:500]
+                results[platform] = exists
+                if exists:
+                    found_count += 1
+            except Exception:
+                results[platform] = False
     return {
         "platforms_found": found_count,
         "details": results,
