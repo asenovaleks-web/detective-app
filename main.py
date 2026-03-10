@@ -4632,6 +4632,67 @@ Write 2-3 sentences in plain English explaining what this email header reveals, 
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# NEWSLETTER UNSUBSCRIBE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/unsubscribe")
+async def unsubscribe_page(email: str = "", token: str = ""):
+    """Handle newsletter unsubscribe via GET — returns confirmation HTML."""
+    if not email:
+        return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Unsubscribe — Signum</title>
+<style>body{margin:0;background:#060912;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;color:#e2e8f0;}
+.card{background:#0d1424;border:1px solid #1e2d45;border-radius:14px;padding:40px;max-width:440px;width:100%;text-align:center;}
+h2{font-size:20px;margin-bottom:12px;}p{color:#64748b;font-size:14px;line-height:1.6;}
+a{color:#3b82f6;text-decoration:none;}</style></head>
+<body><div class="card"><div style="font-size:32px;margin-bottom:16px;">🛡</div>
+<h2>Unsubscribe from Signum Alerts</h2>
+<p>Please use the unsubscribe link in the email you received. If you need help, contact us at <a href="mailto:hello@signumaiapp.com">hello@signumaiapp.com</a></p>
+<p style="margin-top:20px;"><a href="https://www.signumaiapp.com">← Back to Signum</a></p>
+</div></body></html>""", status_code=200)
+
+    # Remove from newsletter_subscribers
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.delete(
+                f"{SUPABASE_URL}/rest/v1/newsletter_subscribers?email=eq.{email}",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+            )
+        success = r.status_code in (200, 204)
+    except Exception as e:
+        logger.error(f"Unsubscribe error: {e}")
+        success = False
+
+    if success:
+        html = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Unsubscribed — Signum</title>
+<style>body{margin:0;background:#060912;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;color:#e2e8f0;}
+.card{background:#0d1424;border:1px solid #1e2d45;border-radius:14px;padding:40px;max-width:440px;width:100%;text-align:center;}
+h2{font-size:20px;margin-bottom:12px;}p{color:#64748b;font-size:14px;line-height:1.6;}
+a{color:#3b82f6;text-decoration:none;}</style></head>
+<body><div class="card"><div style="font-size:32px;margin-bottom:16px;">✓</div>
+<h2>You've been unsubscribed</h2>
+<p>You won't receive any more weekly scam alerts from Signum.</p>
+<p style="margin-top:8px;">Changed your mind? <a href="https://www.signumaiapp.com/?tab=alerts">Re-subscribe here</a></p>
+<p style="margin-top:20px;"><a href="https://www.signumaiapp.com">← Back to Signum</a></p>
+</div></body></html>"""
+    else:
+        html = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Unsubscribe — Signum</title>
+<style>body{margin:0;background:#060912;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;color:#e2e8f0;}
+.card{background:#0d1424;border:1px solid #1e2d45;border-radius:14px;padding:40px;max-width:440px;width:100%;text-align:center;}
+h2{font-size:20px;margin-bottom:12px;}p{color:#64748b;font-size:14px;line-height:1.6;}
+a{color:#3b82f6;text-decoration:none;}</style></head>
+<body><div class="card"><div style="font-size:32px;margin-bottom:16px;">⚠️</div>
+<h2>Something went wrong</h2>
+<p>We couldn't process your unsubscribe request. Please contact us at <a href="mailto:hello@signumaiapp.com">hello@signumaiapp.com</a> and we'll remove you manually.</p>
+<p style="margin-top:20px;"><a href="https://www.signumaiapp.com">← Back to Signum</a></p>
+</div></body></html>"""
+
+    return HTMLResponse(html, status_code=200)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # NEWSLETTER SUBSCRIBE
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -4793,7 +4854,7 @@ async def send_newsletter_digest():
         <!-- Footer -->
         <tr><td style="padding-top:20px;text-align:center;font-size:11px;color:#2a3a55;">
           Signum · <a href="https://www.signumaiapp.com" style="color:#2a3a55;">signumaiapp.com</a> ·
-          <a href="https://www.signumaiapp.com/unsubscribe" style="color:#2a3a55;">Unsubscribe</a>
+          <a href="https://www.signumaiapp.com/unsubscribe?email={{email}}" style="color:#2a3a55;">Unsubscribe</a>
         </td></tr>
 
       </table>
@@ -4808,6 +4869,9 @@ async def send_newsletter_digest():
                 if not email:
                     continue
                 try:
+                    import urllib.parse
+                    email_encoded = urllib.parse.quote(email)
+                    html_personal = html.replace("{{email}}", email_encoded)
                     await client.post(
                         "https://api.resend.com/emails",
                         headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
@@ -4815,7 +4879,7 @@ async def send_newsletter_digest():
                             "from": "Signum Alerts <alerts@signumaiapp.com>",
                             "to": email,
                             "subject": f"🚨 Signum Weekly: {len(alerts)} threats flagged this week",
-                            "html": html
+                            "html": html_personal
                         }
                     )
                     sent += 1
