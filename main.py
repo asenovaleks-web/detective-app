@@ -1502,6 +1502,26 @@ def calculate_base_score(vt_data: dict, gsb_data: dict, whois_data: dict, ssl_da
     score = 30  # neutral baseline
     data_points = 0
 
+    # ══ TRUSTED DOMAIN WHITELIST ══
+    # Well-known legitimate sites that should never score high
+    TRUSTED_DOMAINS = {
+        "flashscore.com","sofascore.com","bbc.com","bbc.co.uk","cnn.com","reuters.com",
+        "theguardian.com","nytimes.com","google.com","youtube.com","facebook.com",
+        "instagram.com","twitter.com","x.com","linkedin.com","reddit.com","wikipedia.org",
+        "amazon.com","ebay.com","etsy.com","paypal.com","stripe.com","shopify.com",
+        "apple.com","microsoft.com","github.com","stackoverflow.com","cloudflare.com",
+        "netflix.com","spotify.com","twitch.tv","discord.com","slack.com","zoom.us",
+        "booking.com","airbnb.com","tripadvisor.com","expedia.com","skyscanner.com",
+        "transferwise.com","wise.com","revolut.com","n26.com","monzo.com",
+        "bbc.co.uk","sky.com","itv.com","channel4.com","dailymail.co.uk",
+        "espn.com","nba.com","nfl.com","uefa.com","fifa.com","whoscored.com",
+        "transfermarkt.com","skysports.com","goal.com","90min.com",
+    }
+
+    # Extract base domain for whitelist check (passed as brand_data context or checked inline)
+    # Note: domain itself isn't passed here, but we can check VT harmless signal strongly
+
+
     # VirusTotal
     if isinstance(vt_data, dict) and vt_data.get("engines_total", 0) > 0:
         data_points += 3
@@ -2055,11 +2075,32 @@ async def perform_full_scan(domain: str, user_id: str = None) -> dict:
 
         analysis = await synthesize_with_claude(domain, all_intelligence, base_score, data_confidence)
 
+        # Whitelist cap — known legitimate domains should never exceed 35 risk score
+        TRUSTED_DOMAINS = {
+            "flashscore.com","sofascore.com","bbc.com","bbc.co.uk","cnn.com","reuters.com",
+            "theguardian.com","nytimes.com","google.com","youtube.com","facebook.com",
+            "instagram.com","twitter.com","x.com","linkedin.com","reddit.com","wikipedia.org",
+            "amazon.com","ebay.com","etsy.com","paypal.com","stripe.com","shopify.com",
+            "apple.com","microsoft.com","github.com","stackoverflow.com","cloudflare.com",
+            "netflix.com","spotify.com","twitch.tv","discord.com","slack.com","zoom.us",
+            "booking.com","airbnb.com","tripadvisor.com","expedia.com","skyscanner.com",
+            "wise.com","revolut.com","espn.com","nba.com","nfl.com","uefa.com","fifa.com",
+            "whoscored.com","transfermarkt.com","skysports.com","goal.com","90min.com",
+            "bbc.co.uk","sky.com","itv.com","dailymail.co.uk","independent.co.uk",
+        }
+        base_domain = domain.replace("www.", "").lower()
+        final_score = analysis.get("score", base_score)
+        final_verdict = analysis.get("verdict", "YELLOW")
+        if base_domain in TRUSTED_DOMAINS and final_score > 35:
+            logger.info(f"Whitelist cap applied for {domain}: {final_score} → 20")
+            final_score = 20
+            final_verdict = "GREEN"
+
         return {
             "domain": domain,
-            "score": analysis.get("score", base_score),
-            "risk_score": analysis.get("score", base_score),
-            "verdict": analysis.get("verdict", "YELLOW"),
+            "score": final_score,
+            "risk_score": final_score,
+            "verdict": final_verdict,
             "verdict_summary": analysis.get("verdict_summary", ""),
             "findings": analysis.get("findings", []),
             "narrative": analysis.get("narrative", ""),
@@ -2725,6 +2766,38 @@ async def sitemap_domains():
 async def health():
     return {"status": "The detective is on duty", "timestamp": datetime.now(timezone.utc).isoformat()}
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXTENSION PUBLIC SCAN ENDPOINT — no API key required, rate limited by IP
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ExtensionScanRequest(BaseModel):
+    domain: str
+
+@app.post("/extension/scan")
+async def extension_scan(req: ExtensionScanRequest, request: Request):
+    """Public scan endpoint for Chrome extension — rate limited by IP, no auth required."""
+    client_ip = request.headers.get("x-forwarded-for", request.client.host).split(",")[0].strip()
+    if is_rate_limited(client_ip, max_calls=10, window=60):
+        raise HTTPException(status_code=429, detail="Too many requests. Please wait a moment.")
+
+    domain = req.domain.strip().lower().replace("www.", "")
+    if not domain or len(domain) < 3:
+        raise HTTPException(status_code=400, detail="Invalid domain")
+
+    try:
+        result = await perform_full_scan(domain, user_id=None)
+        return {
+            "domain": domain,
+            "risk_score": result.get("risk_score", 0),
+            "verdict": result.get("verdict", "unknown"),
+            "verdict_summary": result.get("verdict_summary", ""),
+            "findings": result.get("findings", [])[:6],
+            "cached": result.get("cached", False)
+        }
+    except Exception as e:
+        logger.error(f"Extension scan error {domain}: {e}")
+        raise HTTPException(status_code=500, detail="Scan failed")
 
 
 
