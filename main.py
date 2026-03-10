@@ -4591,6 +4591,81 @@ Write 2-3 sentences in plain English explaining what this email header reveals, 
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# NEWSLETTER SUBSCRIBE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NewsletterSubscribeRequest(BaseModel):
+    email: str
+
+@app.post("/newsletter-subscribe")
+async def newsletter_subscribe(req: NewsletterSubscribeRequest):
+    """Subscribe an email to the Signum weekly scam alerts newsletter."""
+    import re
+    email = req.email.strip().lower()
+    if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
+        raise HTTPException(status_code=400, detail="Invalid email address")
+
+    try:
+        RESEND_KEY = os.environ.get("RESEND_API_KEY", "")
+        if not RESEND_KEY:
+            raise HTTPException(status_code=500, detail="Email service not configured")
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            # Store in Supabase newsletter_subscribers table
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/newsletter_subscribers",
+                headers={
+                    "apikey": SUPABASE_SERVICE,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=ignore-duplicates,return=minimal",
+                },
+                json={"email": email, "subscribed_at": "now()"}
+            )
+
+            if r.status_code not in (200, 201):
+                # Still try to send confirmation even if Supabase insert fails
+                logger.warning(f"Newsletter Supabase insert status: {r.status_code}")
+
+            # Send confirmation email via Resend
+            confirm = await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
+                json={
+                    "from": "Signum <alerts@signumaiapp.com>",
+                    "to": email,
+                    "subject": "You're subscribed to Signum Scam Alerts",
+                    "html": f"""
+                    <div style="font-family:sans-serif;max-width:520px;margin:0 auto;background:#0d1117;color:#e2e8f0;padding:32px;border-radius:12px;">
+                      <div style="display:flex;align-items:center;gap:10px;margin-bottom:24px;">
+                        <div style="background:#2563eb;width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;">🛡</div>
+                        <span style="font-weight:700;font-size:18px;">Signum</span>
+                      </div>
+                      <h1 style="font-size:22px;font-weight:700;margin-bottom:12px;">You're in.</h1>
+                      <p style="color:#94a3b8;line-height:1.6;margin-bottom:20px;">
+                        Every week we'll send you the most dangerous scam domains circulating right now — with real risk scores, what makes them dangerous, and how to spot them.
+                      </p>
+                      <p style="color:#94a3b8;line-height:1.6;margin-bottom:24px;">
+                        In the meantime, scan any domain for free at <a href="https://www.signumaiapp.com" style="color:#3b82f6;">signumaiapp.com</a>
+                      </p>
+                      <div style="border-top:1px solid #1e293b;padding-top:16px;font-size:12px;color:#475569;">
+                        You can unsubscribe at any time. We will never share your email.
+                      </div>
+                    </div>
+                    """
+                }
+            )
+
+        return {"success": True, "message": "Subscribed successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Newsletter subscribe error: {e}")
+        raise HTTPException(status_code=500, detail="Subscription failed")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
