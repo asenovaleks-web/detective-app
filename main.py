@@ -65,6 +65,7 @@ async def lifespan(app):
     asyncio.create_task(weekly_digest_scheduler())
     asyncio.create_task(scam_alert_scanner())
     asyncio.create_task(watchlist_rescan_cron())
+    asyncio.create_task(newsletter_digest_scheduler())
     logger.info("Weekly digest scheduler started")
     logger.info("Scam alert scanner started")
     logger.info("Watchlist rescan cron started")
@@ -2867,22 +2868,24 @@ async def report_site(req: SiteReportRequest, authorization: str = Header(None))
     if not user:
         raise HTTPException(status_code=401, detail="Sign in to submit reports")
 
-    # Rate limiting: max 3 reports per hour per user
+    # Rate limiting: max 3 reports per hour per user — persisted in Supabase
     import time as _time
     user_id = user.get("id", "")
-    now = _time.time()
-    timestamps = _report_rate_limit.get(user_id, [])
-    # Keep only timestamps within window
-    timestamps = [t for t in timestamps if now - t < REPORT_RATE_WINDOW]
-    if len(timestamps) >= REPORT_RATE_LIMIT:
-        wait_secs = int(REPORT_RATE_WINDOW - (now - timestamps[0]))
-        wait_mins = max(1, wait_secs // 60)
+    now_ts = datetime.utcnow()
+    window_start = (now_ts - timedelta(seconds=REPORT_RATE_WINDOW)).isoformat()
+
+    async with httpx.AsyncClient(timeout=8) as rl_client:
+        rl_r = await rl_client.get(
+            f"{SUPABASE_URL}/rest/v1/site_reports?user_id=eq.{user_id}&reported_at=gte.{window_start}&select=id",
+            headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+        )
+        recent_count = len(rl_r.json()) if rl_r.status_code == 200 else 0
+
+    if recent_count >= REPORT_RATE_LIMIT:
         raise HTTPException(
             status_code=429,
-            detail=f"Too many reports. Please wait {wait_mins} minute(s) before submitting again."
+            detail=f"Too many reports. You can submit up to {REPORT_RATE_LIMIT} reports per hour."
         )
-    timestamps.append(now)
-    _report_rate_limit[user_id] = timestamps
 
     category_labels = {
         "fake_shop": "🛒 Fake Shop",
@@ -4225,6 +4228,10 @@ async def weekly_digest_scheduler():
 RSS_SOURCES = [
     "https://www.reddit.com/r/Scams/new/.rss",
     "https://www.reddit.com/r/scams/new/.rss",
+    "https://www.reddit.com/r/scambaiting/new/.rss",
+    "https://www.reddit.com/r/cybersecurity_help/new/.rss",
+    "https://www.reddit.com/r/phishing/new/.rss",
+    "https://www.reddit.com/r/fraud/new/.rss",
 ]
 
 def extract_domains_from_text(text: str) -> list:
@@ -4697,6 +4704,141 @@ async def newsletter_subscribe(req: NewsletterSubscribeRequest):
     except Exception as e:
         logger.error(f"Newsletter subscribe error: {e}")
         raise HTTPException(status_code=500, detail="Subscription failed")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEWSLETTER DIGEST — weekly email to all subscribers
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def send_newsletter_digest():
+    """Send weekly scam alert digest to all newsletter subscribers."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE:
+        return
+    RESEND_KEY = os.environ.get("RESEND_API_KEY", "")
+    if not RESEND_KEY:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Get all subscribers
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/newsletter_subscribers?select=email&order=subscribed_at.desc",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+            )
+            subscribers = r.json() if r.status_code == 200 else []
+            if not subscribers:
+                logger.info("Newsletter digest: no subscribers")
+                return
+
+            # Get top scam alerts from last 7 days
+            week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+            r2 = await client.get(
+                f"{SUPABASE_URL}/rest/v1/scam_alerts?created_at=gte.{week_ago}&order=risk_score.desc&limit=5&select=domain,headline,risk_score,verdict",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+            )
+            alerts = r2.json() if r2.status_code == 200 else []
+
+        if not alerts:
+            logger.info("Newsletter digest: no alerts this week, skipping")
+            return
+
+        # Build alert rows HTML
+        rows_html = ""
+        for a in alerts:
+            score = a.get("risk_score", 0)
+            color = "#f87171" if score >= 70 else "#fbbf24" if score >= 40 else "#34d399"
+            headline = a.get("headline", "")[:90] + ("..." if len(a.get("headline", "")) > 90 else "")
+            rows_html += f"""
+            <tr>
+              <td style="padding:12px 0;border-bottom:1px solid #1e293b;">
+                <div style="display:flex;align-items:center;gap:12px;">
+                  <span style="font-size:16px;font-weight:700;color:{color};min-width:32px;">{score}</span>
+                  <div>
+                    <div style="font-weight:600;color:#e2e8f0;font-family:'Courier New',monospace;font-size:13px;">{a.get('domain','')}</div>
+                    <div style="font-size:12px;color:#64748b;margin-top:2px;">{headline}</div>
+                  </div>
+                </div>
+              </td>
+            </tr>"""
+
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#060912;font-family:-apple-system,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#060912;padding:32px 16px;">
+    <tr><td align="center">
+      <table width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;">
+
+        <!-- Header -->
+        <tr><td style="padding-bottom:24px;">
+          <table cellpadding="0" cellspacing="0"><tr>
+            <td style="background:#1a2235;border-radius:10px;width:40px;height:40px;text-align:center;vertical-align:middle;font-size:20px;">🛡</td>
+            <td style="padding-left:12px;vertical-align:middle;font-size:18px;font-weight:700;color:#e8edf5;">Signum</td>
+          </tr></table>
+        </td></tr>
+
+        <!-- Card -->
+        <tr><td style="background:#0d1424;border:1px solid #1e2d45;border-radius:14px;padding:28px;">
+          <div style="font-size:11px;font-weight:700;letter-spacing:1px;color:#3b82f6;text-transform:uppercase;margin-bottom:8px;">Weekly Scam Alert</div>
+          <div style="font-size:20px;font-weight:700;color:#e8edf5;margin-bottom:6px;">Top threats this week</div>
+          <div style="font-size:13px;color:#64748b;margin-bottom:24px;">Domains flagged by our AI scanner and community in the last 7 days.</div>
+
+          <table width="100%" cellpadding="0" cellspacing="0">
+            {rows_html}
+          </table>
+
+          <div style="margin-top:24px;">
+            <a href="https://www.signumaiapp.com/?tab=alerts" style="display:block;background:#2563eb;color:#fff;padding:13px 20px;border-radius:9px;text-decoration:none;font-weight:600;font-size:14px;text-align:center;">View all alerts →</a>
+          </div>
+        </td></tr>
+
+        <!-- Footer -->
+        <tr><td style="padding-top:20px;text-align:center;font-size:11px;color:#2a3a55;">
+          Signum · <a href="https://www.signumaiapp.com" style="color:#2a3a55;">signumaiapp.com</a> ·
+          <a href="https://www.signumaiapp.com/unsubscribe" style="color:#2a3a55;">Unsubscribe</a>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body></html>"""
+
+        sent = 0
+        async with httpx.AsyncClient(timeout=10) as client:
+            for sub in subscribers:
+                email = sub.get("email", "")
+                if not email:
+                    continue
+                try:
+                    await client.post(
+                        "https://api.resend.com/emails",
+                        headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
+                        json={
+                            "from": "Signum Alerts <alerts@signumaiapp.com>",
+                            "to": email,
+                            "subject": f"🚨 Signum Weekly: {len(alerts)} threats flagged this week",
+                            "html": html
+                        }
+                    )
+                    sent += 1
+                    await asyncio.sleep(0.2)  # Resend rate limit
+                except Exception as e:
+                    logger.error(f"Newsletter digest send error {email}: {e}")
+
+        logger.info(f"Newsletter digest sent to {sent}/{len(subscribers)} subscribers")
+
+    except Exception as e:
+        logger.error(f"Newsletter digest error: {e}")
+
+
+async def newsletter_digest_scheduler():
+    """Run newsletter digest every Monday at 09:00 UTC."""
+    await asyncio.sleep(15)
+    while True:
+        now = datetime.now(timezone.utc)
+        days_until_monday = (7 - now.weekday()) % 7 or 7
+        seconds_until = days_until_monday * 86400 - now.hour * 3600 - now.minute * 60 - now.second + 3600  # 09:00 UTC
+        logger.info(f"Newsletter digest scheduled in {seconds_until//3600}h")
+        await asyncio.sleep(seconds_until)
+        await send_newsletter_digest()
 
 
 if __name__ == "__main__":
