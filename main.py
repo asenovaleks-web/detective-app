@@ -2959,20 +2959,53 @@ async def report_site(req: SiteReportRequest, authorization: str = Header(None))
                         "from": "Signum <noreply@signumaiapp.com>",
                         "to": ["asenovaleks@yahoo.com"],
                         "subject": f"{cat_label} — Site reported: {req.domain}",
-                        "html": f"""
-                        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#0b0f1a;color:#e8edf5;padding:32px;border-radius:12px;">
-                          <h2 style="margin-bottom:20px;color:#ef4444;">⚑ New Site Report</h2>
-                          <table style="width:100%;border-collapse:collapse;">
-                            <tr><td style="padding:8px 0;color:#7a8aaa;width:120px;">Domain</td><td style="padding:8px 0;font-weight:600;font-family:monospace;color:#3b82f6;">{req.domain}</td></tr>
-                            <tr><td style="padding:8px 0;color:#7a8aaa;">Category</td><td style="padding:8px 0;font-weight:600;">{cat_label}</td></tr>
-                            <tr><td style="padding:8px 0;color:#7a8aaa;">Reported by</td><td style="padding:8px 0;">{user.get('email', 'Unknown')}</td></tr>
-                            <tr><td style="padding:8px 0;color:#7a8aaa;">Details</td><td style="padding:8px 0;color:#7a8aaa;">{req.details or 'No details provided'}</td></tr>
-                          </table>
-                          <div style="margin-top:24px;">
-                            <a href="https://signumaiapp.com/?domain={req.domain}" style="display:inline-block;background:#3b82f6;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;font-size:14px;">Scan this domain →</a>
-                          </div>
-                        </div>
-                        """,
+                        "html": f"""<!DOCTYPE html>
+<html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head>
+<body style=\"margin:0;padding:0;background:#060912;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;\">
+  <table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#060912;padding:32px 16px;\">
+    <tr><td align=\"center\">
+      <table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:500px;\">
+        <tr><td style=\"padding-bottom:24px;\">
+          <table cellpadding=\"0\" cellspacing=\"0\"><tr>
+            <td style=\"background:#1a2235;border-radius:10px;width:40px;height:40px;text-align:center;vertical-align:middle;\"><span style=\"font-size:20px;line-height:40px;\">🛡</span></td>
+            <td style=\"padding-left:12px;vertical-align:middle;\"><span style=\"font-size:18px;font-weight:700;color:#e8edf5;\">Signum</span></td>
+          </tr></table>
+        </td></tr>
+        <tr><td style=\"background:#0d1424;border:1px solid #1e2d45;border-radius:14px;padding:28px;\">
+          <table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-bottom:20px;\"><tr><td>
+            <span style=\"display:inline-block;background:rgba(239,68,68,0.12);border:1px solid rgba(239,68,68,0.25);border-radius:6px;padding:3px 10px;font-size:11px;font-weight:700;color:#f87171;letter-spacing:0.8px;text-transform:uppercase;\">New Report</span>
+            <div style=\"font-size:20px;font-weight:700;color:#e8edf5;margin-top:10px;\">Site flagged by community</div>
+          </td></tr></table>
+          <div style=\"border-top:1px solid #1e2d45;margin-bottom:20px;\"></div>
+          <table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\">
+            <tr><td style=\"padding:10px 0;border-bottom:1px solid #141e30;\">
+              <span style=\"font-size:11px;font-weight:600;color:#4a6080;text-transform:uppercase;letter-spacing:0.6px;\">Domain</span><br>
+              <span style=\"font-size:15px;font-weight:700;color:#3b82f6;font-family:'Courier New',monospace;margin-top:3px;display:block;\">{req.domain}</span>
+            </td></tr>
+            <tr><td style=\"padding:10px 0;border-bottom:1px solid #141e30;\">
+              <span style=\"font-size:11px;font-weight:600;color:#4a6080;text-transform:uppercase;letter-spacing:0.6px;\">Category</span><br>
+              <span style=\"font-size:14px;color:#e8edf5;margin-top:3px;display:block;\">{cat_label}</span>
+            </td></tr>
+            <tr><td style=\"padding:10px 0;border-bottom:1px solid #141e30;\">
+              <span style=\"font-size:11px;font-weight:600;color:#4a6080;text-transform:uppercase;letter-spacing:0.6px;\">Reported by</span><br>
+              <span style=\"font-size:14px;color:#e8edf5;margin-top:3px;display:block;\">{user.get('email', 'Unknown')}</span>
+            </td></tr>
+            <tr><td style=\"padding:10px 0;\">
+              <span style=\"font-size:11px;font-weight:600;color:#4a6080;text-transform:uppercase;letter-spacing:0.6px;\">Details</span><br>
+              <span style=\"font-size:14px;color:#e8edf5;margin-top:3px;display:block;\">{req.details or 'No details provided'}</span>
+            </td></tr>
+          </table>
+          <div style=\"margin-top:24px;\">
+            <a href=\"https://www.signumaiapp.com/?domain={req.domain}\" style=\"display:block;background:#2563eb;color:#fff;padding:13px 20px;border-radius:9px;text-decoration:none;font-weight:600;font-size:14px;text-align:center;\">Scan this domain →</a>
+          </div>
+        </td></tr>
+        <tr><td style=\"padding-top:20px;text-align:center;\">
+          <span style=\"font-size:11px;color:#2a3a55;\">Signum · Website Trust Intelligence · <a href=\"https://www.signumaiapp.com\" style=\"color:#2a3a55;\">signumaiapp.com</a></span>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>""",
                     },
                     timeout=10,
                 )
