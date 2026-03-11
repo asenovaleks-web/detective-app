@@ -2767,9 +2767,100 @@ async def health():
     return {"status": "The detective is on duty", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# EXTENSION PUBLIC SCAN ENDPOINT — no API key required, rate limited by IP
-# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/scam-alerts-page", response_class=HTMLResponse)
+async def scam_alerts_seo_page():
+    """SEO-optimized standalone scam alerts page."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/scam_alerts?select=domain,headline,risk_score,verdict,source_url,created_at&order=created_at.desc&limit=50",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+            )
+            alerts = r.json() if r.status_code == 200 else []
+    except Exception:
+        alerts = []
+
+    rows_html = ""
+    for a in alerts:
+        score = a.get("risk_score", 0)
+        color = "#f87171" if score >= 70 else "#fbbf24" if score >= 40 else "#34d399"
+        verdict = (a.get("verdict") or "").upper()
+        verdict_label = "Danger" if verdict == "RED" else "Suspicious" if verdict == "YELLOW" else "Safe"
+        headline = (a.get("headline") or "")[:100]
+        domain = a.get("domain", "")
+        rows_html += f"""
+        <tr style="border-bottom:1px solid #1e2d45;">
+          <td style="padding:12px 8px;">
+            <a href="https://www.signumaiapp.com/?domain={domain}" style="color:#3b82f6;font-family:monospace;font-size:13px;text-decoration:none;font-weight:600;">{domain}</a>
+            <div style="font-size:11px;color:#475569;margin-top:3px;">{headline}</div>
+          </td>
+          <td style="padding:12px 8px;text-align:center;font-weight:700;color:{color};">{score}</td>
+          <td style="padding:12px 8px;text-align:center;font-size:12px;color:{color};">{verdict_label}</td>
+        </tr>"""
+
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Scam Alert Database — Signum | Dangerous Domains Flagged by AI</title>
+  <meta name="description" content="Live database of scam websites, phishing domains, and fraudulent sites flagged by Signum's AI scanner and community. Updated continuously.">
+  <meta property="og:title" content="Scam Alert Database — Signum">
+  <meta property="og:description" content="Real-time database of dangerous domains flagged by AI and community reports.">
+  <link rel="canonical" href="https://www.signumaiapp.com/scam-alerts-page">
+  <style>
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{background:#060912;color:#e2e8f0;font-family:-apple-system,sans-serif;line-height:1.6}}
+    .container{{max-width:760px;margin:0 auto;padding:32px 16px 80px}}
+    nav{{display:flex;align-items:center;justify-content:space-between;padding-bottom:24px;border-bottom:1px solid #1e2d45;margin-bottom:40px}}
+    .logo{{display:flex;align-items:center;gap:8px;font-size:16px;font-weight:700;color:#e2e8f0;text-decoration:none}}
+    .back{{font-size:13px;color:#475569;text-decoration:none;border:1px solid #1e2d45;border-radius:7px;padding:6px 14px}}
+    .back:hover{{color:#3b82f6;border-color:#3b82f6}}
+    h1{{font-size:clamp(24px,4vw,36px);font-weight:700;letter-spacing:-0.8px;margin-bottom:8px}}
+    .sub{{font-size:15px;color:#64748b;margin-bottom:32px;line-height:1.6}}
+    table{{width:100%;border-collapse:collapse;background:#0d1424;border:1px solid #1e2d45;border-radius:12px;overflow:hidden}}
+    th{{text-align:left;padding:12px 8px;font-size:10px;font-family:monospace;font-weight:700;letter-spacing:0.8px;color:#334155;text-transform:uppercase;border-bottom:1px solid #1e2d45}}
+    .cta{{margin-top:32px;text-align:center;padding:28px;background:#0d1424;border:1px solid #1e2d45;border-radius:12px}}
+    .cta h2{{font-size:20px;font-weight:700;margin-bottom:8px}}
+    .cta p{{font-size:14px;color:#64748b;margin-bottom:20px}}
+    .cta a{{display:inline-block;background:#3b82f6;color:#fff;padding:12px 28px;border-radius:9px;text-decoration:none;font-weight:600;font-size:14px}}
+    footer{{margin-top:48px;text-align:center;font-size:12px;color:#1e2d45}}
+    footer a{{color:#1e2d45;text-decoration:none}}
+  </style>
+</head>
+<body>
+<div class="container">
+  <nav>
+    <a href="https://www.signumaiapp.com" class="logo">🛡 Signum</a>
+    <a href="https://www.signumaiapp.com" class="back">← Scan a domain</a>
+  </nav>
+
+  <h1>Scam Alert Database</h1>
+  <p class="sub">Domains flagged as dangerous by Signum's AI scanner and community reports. Updated continuously. Click any domain to run a full scan.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Domain</th>
+        <th style="text-align:center;width:80px;">Risk Score</th>
+        <th style="text-align:center;width:100px;">Verdict</th>
+      </tr>
+    </thead>
+    <tbody>
+      {rows_html if rows_html else '<tr><td colspan="3" style="text-align:center;padding:32px;color:#334155;">No alerts yet — check back soon.</td></tr>'}
+    </tbody>
+  </table>
+
+  <div class="cta">
+    <h2>Check any website instantly</h2>
+    <p>Paste any domain and get an AI-powered trust verdict in seconds. Free, no account needed.</p>
+    <a href="https://www.signumaiapp.com">Scan a domain →</a>
+  </div>
+
+  <footer>© 2026 Signum · <a href="https://www.signumaiapp.com/privacy.html">Privacy</a> · <a href="https://www.signumaiapp.com/terms.html">Terms</a></footer>
+</div>
+</body></html>""")
+
+
 
 class ExtensionScanRequest(BaseModel):
     domain: str
