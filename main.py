@@ -4584,8 +4584,10 @@ async def analyze_email_header(req: EmailHeaderRequest):
     msg_id       = extract(r"^Message-ID:\s*(.+)$", raw)
     date_str     = extract(r"^Date:\s*(.+)$", raw)
 
-    # SPF
-    spf_result   = extract(r"spf=(\w+)", raw)
+    # SPF — try Authentication-Results first, then Received-SPF header
+    spf_result = extract(r"spf=(\w+)", raw)
+    if not spf_result:
+        spf_result = extract(r"^received-spf:\s*(\w+)", raw, flags=_re.IGNORECASE | _re.MULTILINE)
     # DKIM
     dkim_result  = extract(r"dkim=(\w+)", raw)
     # DMARC
