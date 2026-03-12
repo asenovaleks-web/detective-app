@@ -4565,6 +4565,12 @@ async def analyze_email_header(req: EmailHeaderRequest):
     raw = req.raw_header.strip()
     if not raw or len(raw) < 20:
         raise HTTPException(status_code=400, detail="No header provided")
+    # Strip email body
+    _sep = raw.find("\r\n\r\n")
+    if _sep == -1:
+        _sep = raw.find("\n\n")
+    if _sep != -1:
+        raw = raw[:_sep]
     if len(raw) > 50000:
         raise HTTPException(status_code=400, detail="Header too long")
 
@@ -4587,7 +4593,7 @@ async def analyze_email_header(req: EmailHeaderRequest):
     # SPF — try Authentication-Results first, then Received-SPF header
     spf_result = extract(r"spf=(\w+)", raw)
     if not spf_result:
-        spf_result = extract(r"^received-spf:\s*(\w+)", raw, flags=_re.IGNORECASE | _re.MULTILINE)
+        spf_result = extract(r"^received-spf:\s*(\w+)", raw)
     # DKIM
     dkim_result  = extract(r"dkim=(\w+)", raw)
     # DMARC
