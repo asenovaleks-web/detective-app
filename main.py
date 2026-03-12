@@ -75,7 +75,7 @@ app = FastAPI(title="The Digital Detective API", version="3.0.0", lifespan=lifes
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://signumaiapp.com", "https://www.signumaiapp.com"],
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
@@ -3692,7 +3692,7 @@ def generate_pdf_report(result: dict, diff: list = None, tz_offset: int = 0) -> 
             _utc_dt = datetime.strptime(_raw_date, "%d %b %H:%M").replace(year=datetime.now().year, tzinfo=timezone.utc)
             _local_dt = _utc_dt + _td(minutes=tz_offset)
             scan_date = _local_dt.strftime("%d %b %H:%M")
-        except:
+        except Exception:
             scan_date = _raw_date
 
         # Header
@@ -4075,75 +4075,6 @@ body{{background:#0a0f1e;color:#e2e8f0;font-family:"DM Sans",sans-serif;min-heig
 
     from fastapi.responses import HTMLResponse
     return HTMLResponse(content=html)
-
-
-
-@app.post("/affiliate-apply")
-async def affiliate_apply(request: Request):
-    """Handle affiliate program applications — forward to email."""
-    try:
-        body = await request.json()
-        name = body.get("name", "").strip()
-        email = body.get("email", "").strip()
-        channel = body.get("channel", "")
-        url = body.get("url", "").strip()
-        audience = body.get("audience", "")
-        note = body.get("note", "").strip()
-        if not name or not email:
-            raise HTTPException(status_code=400, detail="Missing fields")
-        if not RESEND_KEY:
-            raise HTTPException(status_code=503, detail="Email not configured")
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                "https://api.resend.com/emails",
-                headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
-                json={
-                    "from": "Signum Affiliates <noreply@signumaiapp.com>",
-                    "to": ["hello@signumaiapp.com"],
-                    "reply_to": email,
-                    "subject": f"[Affiliate Application] {name} — {channel} — {audience}",
-                    "text": f"Name: {name}\nEmail: {email}\nChannel: {channel}\nURL: {url}\nAudience: {audience}\n\nHow they'll promote Signum:\n{note}"
-                },
-                timeout=10,
-            )
-        return {"ok": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"affiliate_apply error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to send")
-
-@app.post("/contact")
-async def contact_form(request: Request):
-    """Handle contact form submissions — forward to email."""
-    try:
-        body = await request.json()
-        email = body.get("email", "").strip()
-        subject = body.get("subject", "other")
-        message = body.get("message", "").strip()
-        if not email or not message:
-            raise HTTPException(status_code=400, detail="Missing fields")
-        if not RESEND_KEY:
-            raise HTTPException(status_code=503, detail="Email not configured")
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                "https://api.resend.com/emails",
-                headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
-                json={
-                    "from": "Signum Contact <noreply@signumaiapp.com>",
-                    "to": ["hello@signumaiapp.com"],
-                    "reply_to": email,
-                    "subject": f"[Signum Contact] {subject} — {email}",
-                    "text": f"From: {email}\nTopic: {subject}\n\n{message}"
-                },
-                timeout=10,
-            )
-        return {"ok": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"contact_form error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to send")
 
 
 @app.get("/recent-activity")
@@ -4565,7 +4496,7 @@ async def analyze_email_header(req: EmailHeaderRequest):
     raw = req.raw_header.strip()
     if not raw or len(raw) < 20:
         raise HTTPException(status_code=400, detail="No header provided")
-    # Strip email body
+    # Strip email body — headers end at first blank line
     _sep = raw.find("\r\n\r\n")
     if _sep == -1:
         _sep = raw.find("\n\n")
