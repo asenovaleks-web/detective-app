@@ -1463,7 +1463,9 @@ IMPORTANT DISTINCTIONS:
 - payment_detection: high_risk_payment_method=true (crypto/gift cards/wire transfer) is a very strong scam signal. payment_without_processor=true (has checkout but no Stripe/PayPal) on a suspicious site = direct financial risk — highlight prominently.
 - tech_fingerprint: pirated_theme=true is a direct scam signal. no_analytics and no known CMS on a supposed business site is suspicious. has_csp and has_hsts are positive security signals.
 - ip_neighbourhood: shared_hosting_risk=true (50+ sites on same IP) suggests scam farm infrastructure.
-- visual_analysis: if impersonates_brand=true, this is extremely high risk — the site is visually copying a known brand. Always mention this prominently in findings and narrative. red_flags list contains specific visual issues found."""
+- visual_analysis: if impersonates_brand=true, this is extremely high risk — the site is visually copying a known brand. Always mention this prominently in findings and narrative. red_flags list contains specific visual issues found.
+- is_file_hosting=true means the domain is a known file hosting platform (e.g. file.garden, wetransfer.com, gofile.io, mediafire.com). The platform itself may be legitimate, but individual files hosted on it cannot be verified. Always add a CAUTION finding that the platform is safe but individual files are unverified — especially executables, .reg, .zip, .bat files.
+- is_free_subdomain=true means the domain uses a free subdomain service like .it.com, .cjb.net, .ddns.net. These are heavily abused for phishing. Treat as CAUTION-to-RISK depending on other signals and always mention in findings."""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -2048,8 +2050,22 @@ async def perform_full_scan(domain: str, user_id: str = None) -> dict:
          ipqs_data, abuseipdb_data, otx_data, dns_data,
          companies_house_data, sec_edgar_data, gleif_data) = results
 
+        # Detect file hosting platforms and free subdomain abuse
+        FILE_HOSTING_DOMAINS = {
+            "file.garden", "wetransfer.com", "gofile.io", "mediafire.com",
+            "mega.nz", "sendspace.com", "zippyshare.com", "uploaded.net",
+            "rapidgator.net", "4shared.com", "box.com", "dropbox.com",
+            "files.fm", "filebin.net", "pixeldrain.com", "anonfiles.com",
+        }
+        FREE_SUBDOMAIN_TLDS = {".it.com", ".cjb.net", ".ddns.net", ".dyndns.org", ".no-ip.org", ".freedns.ws"}
+        base_domain_check = domain.replace("www.", "").lower()
+        is_file_hosting = base_domain_check in FILE_HOSTING_DOMAINS
+        is_free_subdomain = any(base_domain_check.endswith(tld) for tld in FREE_SUBDOMAIN_TLDS)
+
         all_intelligence = {
             "target": domain,
+            "is_file_hosting": is_file_hosting,
+            "is_free_subdomain": is_free_subdomain,
             "whois": whois_data,
             "companies_house": companies_house_data,
             "sec_edgar": sec_edgar_data,
