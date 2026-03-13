@@ -3264,6 +3264,9 @@ class ContactRequest(BaseModel):
 @app.post("/affiliate-apply")
 async def affiliate_apply(request: Request):
     """Handle affiliate program applications — forward to email."""
+    client_ip = request.client.host
+    if is_rate_limited(client_ip, max_calls=3, window=600):
+        raise HTTPException(status_code=429, detail="Too many requests.")
     try:
         body = await request.json()
         name = body.get("name", "").strip()
@@ -3297,8 +3300,11 @@ async def affiliate_apply(request: Request):
         raise HTTPException(status_code=500, detail="Failed to send")
 
 @app.post("/contact")
-async def contact_form(req: ContactRequest):
+async def contact_form(req: ContactRequest, request: Request):
     """Handle contact form submissions."""
+    client_ip = request.client.host
+    if is_rate_limited(client_ip, max_calls=3, window=300):
+        raise HTTPException(status_code=429, detail="Too many requests.")
     try:
         RESEND_KEY = _env.get("RESEND_API_KEY", "")
         if not RESEND_KEY:
@@ -4534,7 +4540,10 @@ class EmailHeaderRequest(BaseModel):
     raw_header: str
 
 @app.post("/analyze-email-header")
-async def analyze_email_header(req: EmailHeaderRequest):
+async def analyze_email_header(req: EmailHeaderRequest, request: Request):
+    client_ip = request.client.host
+    if is_rate_limited(client_ip, max_calls=10, window=60):
+        raise HTTPException(status_code=429, detail="Too many requests.")
     """Parse and analyze email headers for phishing/spoofing signals."""
     import re as _re
 
@@ -4848,8 +4857,11 @@ class NewsletterSubscribeRequest(BaseModel):
     email: str
 
 @app.post("/newsletter-subscribe")
-async def newsletter_subscribe(req: NewsletterSubscribeRequest):
+async def newsletter_subscribe(req: NewsletterSubscribeRequest, request: Request):
     """Subscribe an email to the Signum weekly scam alerts newsletter."""
+    client_ip = request.client.host
+    if is_rate_limited(client_ip, max_calls=5, window=300):
+        raise HTTPException(status_code=429, detail="Too many requests.")
     import re
     email = req.email.strip().lower()
     if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
