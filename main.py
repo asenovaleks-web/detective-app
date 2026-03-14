@@ -75,7 +75,7 @@ app = FastAPI(title="The Digital Detective API", version="3.0.0", lifespan=lifes
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://signumaiapp.com", "https://www.signumaiapp.com"],
+    allow_origins=["*"],
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
@@ -1463,9 +1463,7 @@ IMPORTANT DISTINCTIONS:
 - payment_detection: high_risk_payment_method=true (crypto/gift cards/wire transfer) is a very strong scam signal. payment_without_processor=true (has checkout but no Stripe/PayPal) on a suspicious site = direct financial risk — highlight prominently.
 - tech_fingerprint: pirated_theme=true is a direct scam signal. no_analytics and no known CMS on a supposed business site is suspicious. has_csp and has_hsts are positive security signals.
 - ip_neighbourhood: shared_hosting_risk=true (50+ sites on same IP) suggests scam farm infrastructure.
-- visual_analysis: if impersonates_brand=true, this is extremely high risk — the site is visually copying a known brand. Always mention this prominently in findings and narrative. red_flags list contains specific visual issues found.
-- is_file_hosting=true means the domain is a known file hosting platform (e.g. file.garden, wetransfer.com, gofile.io, mediafire.com). The platform itself may be legitimate, but individual files hosted on it cannot be verified. Always add a CAUTION finding that the platform is safe but individual files are unverified — especially executables, .reg, .zip, .bat files.
-- is_free_subdomain=true means the domain uses a free subdomain service like .it.com, .cjb.net, .ddns.net. These are heavily abused for phishing. Treat as CAUTION-to-RISK depending on other signals and always mention in findings."""
+- visual_analysis: if impersonates_brand=true, this is extremely high risk — the site is visually copying a known brand. Always mention this prominently in findings and narrative. red_flags list contains specific visual issues found."""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -1478,7 +1476,20 @@ IMPORTANT DISTINCTIONS:
     if "error" in response_json:
         raise HTTPException(status_code=500, detail=f"Claude API error: {response_json['error']}")
     text = response_json["content"][0]["text"]
-    return json.loads(text.replace("```json", "").replace("```", "").strip())
+    clean = text.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        # Try to extract JSON object if Claude added extra text
+        import re as _re2
+        match = _re2.search(r'\{.*\}', clean, _re2.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group())
+            except Exception:
+                pass
+        logger.error(f"Claude JSON parse error for text: {clean[:200]}")
+        raise HTTPException(status_code=500, detail="AI analysis returned invalid JSON")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2050,22 +2061,8 @@ async def perform_full_scan(domain: str, user_id: str = None) -> dict:
          ipqs_data, abuseipdb_data, otx_data, dns_data,
          companies_house_data, sec_edgar_data, gleif_data) = results
 
-        # Detect file hosting platforms and free subdomain abuse
-        FILE_HOSTING_DOMAINS = {
-            "file.garden", "wetransfer.com", "gofile.io", "mediafire.com",
-            "mega.nz", "sendspace.com", "zippyshare.com", "uploaded.net",
-            "rapidgator.net", "4shared.com", "box.com", "dropbox.com",
-            "files.fm", "filebin.net", "pixeldrain.com", "anonfiles.com",
-        }
-        FREE_SUBDOMAIN_TLDS = {".it.com", ".cjb.net", ".ddns.net", ".dyndns.org", ".no-ip.org", ".freedns.ws"}
-        base_domain_check = domain.replace("www.", "").lower()
-        is_file_hosting = base_domain_check in FILE_HOSTING_DOMAINS
-        is_free_subdomain = any(base_domain_check.endswith(tld) for tld in FREE_SUBDOMAIN_TLDS)
-
         all_intelligence = {
             "target": domain,
-            "is_file_hosting": is_file_hosting,
-            "is_free_subdomain": is_free_subdomain,
             "whois": whois_data,
             "companies_house": companies_house_data,
             "sec_edgar": sec_edgar_data,
@@ -2353,7 +2350,7 @@ async def investigate(req: InvestigateRequest, request: Request):
             "otx_alienvault": otx_data,
             "dns_intelligence": dns_data,
             "homepage_analysis": {k: v for k, v in (homepage_data if isinstance(homepage_data, dict) else {}).items() if k != "homepage_text"},
-            "homepage_text_sample": (homepage_data.get("homepage_text", "")[:1500] if isinstance(homepage_data, dict) else ""),
+            "homepage_text_sample": (homepage_data.get("homepage_text", "")[:1500].replace("\\", " ").replace('"', " ") if isinstance(homepage_data, dict) else ""),
             "brand_similarity": brand_data,
             "social_presence": social_data,
             "certificate_transparency": cert_data,
@@ -2656,36 +2653,7 @@ def build_seo_page(domain: str, result: dict) -> str:
   <meta property="og:description" content="{description}"/>
   <meta property="og:url" content="https://signumaiapp.com/is-{domain}-safe"/>
   <meta name="twitter:card" content="summary"/>
-  <script type="application/ld+json">
-  {{
-    "@context": "https://schema.org",
-    "@type": "WebPage",
-    "name": "Is {domain} safe?",
-    "description": "{description}",
-    "url": "https://signumaiapp.com/is-{domain}-safe",
-    "mainEntity": {{
-      "@type": "Review",
-      "name": "Trust Report for {domain}",
-      "reviewBody": "{summary}",
-      "reviewRating": {{
-        "@type": "Rating",
-        "ratingValue": "{score}",
-        "bestRating": "100",
-        "worstRating": "0"
-      }},
-      "author": {{
-        "@type": "Organization",
-        "name": "Signum AI"
-      }},
-      "itemReviewed": {{
-        "@type": "WebSite",
-        "name": "{domain}",
-        "url": "https://{domain}"
-      }}
-    }}
-  }}
-  </script>
-  <link rel="canonical" href="https://signumaiapp.com/is-{domain}-safe"/>
+  <link rel="canonical" href="https://signumaiapp.com/?domain={domain}"/>
   <style>
     *{{box-sizing:border-box;margin:0;padding:0}}
     body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0a0f1e;color:#e2e8f0;min-height:100vh}}
@@ -3264,9 +3232,6 @@ class ContactRequest(BaseModel):
 @app.post("/affiliate-apply")
 async def affiliate_apply(request: Request):
     """Handle affiliate program applications — forward to email."""
-    client_ip = request.client.host
-    if is_rate_limited(client_ip, max_calls=3, window=600):
-        raise HTTPException(status_code=429, detail="Too many requests.")
     try:
         body = await request.json()
         name = body.get("name", "").strip()
@@ -3300,11 +3265,8 @@ async def affiliate_apply(request: Request):
         raise HTTPException(status_code=500, detail="Failed to send")
 
 @app.post("/contact")
-async def contact_form(req: ContactRequest, request: Request):
+async def contact_form(req: ContactRequest):
     """Handle contact form submissions."""
-    client_ip = request.client.host
-    if is_rate_limited(client_ip, max_calls=3, window=300):
-        raise HTTPException(status_code=429, detail="Too many requests.")
     try:
         RESEND_KEY = _env.get("RESEND_API_KEY", "")
         if not RESEND_KEY:
@@ -3743,7 +3705,7 @@ def generate_pdf_report(result: dict, diff: list = None, tz_offset: int = 0) -> 
             _utc_dt = datetime.strptime(_raw_date, "%d %b %H:%M").replace(year=datetime.now().year, tzinfo=timezone.utc)
             _local_dt = _utc_dt + _td(minutes=tz_offset)
             scan_date = _local_dt.strftime("%d %b %H:%M")
-        except Exception:
+        except:
             scan_date = _raw_date
 
         # Header
@@ -4126,6 +4088,75 @@ body{{background:#0a0f1e;color:#e2e8f0;font-family:"DM Sans",sans-serif;min-heig
 
     from fastapi.responses import HTMLResponse
     return HTMLResponse(content=html)
+
+
+
+@app.post("/affiliate-apply")
+async def affiliate_apply(request: Request):
+    """Handle affiliate program applications — forward to email."""
+    try:
+        body = await request.json()
+        name = body.get("name", "").strip()
+        email = body.get("email", "").strip()
+        channel = body.get("channel", "")
+        url = body.get("url", "").strip()
+        audience = body.get("audience", "")
+        note = body.get("note", "").strip()
+        if not name or not email:
+            raise HTTPException(status_code=400, detail="Missing fields")
+        if not RESEND_KEY:
+            raise HTTPException(status_code=503, detail="Email not configured")
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
+                json={
+                    "from": "Signum Affiliates <noreply@signumaiapp.com>",
+                    "to": ["hello@signumaiapp.com"],
+                    "reply_to": email,
+                    "subject": f"[Affiliate Application] {name} — {channel} — {audience}",
+                    "text": f"Name: {name}\nEmail: {email}\nChannel: {channel}\nURL: {url}\nAudience: {audience}\n\nHow they'll promote Signum:\n{note}"
+                },
+                timeout=10,
+            )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"affiliate_apply error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send")
+
+@app.post("/contact")
+async def contact_form(request: Request):
+    """Handle contact form submissions — forward to email."""
+    try:
+        body = await request.json()
+        email = body.get("email", "").strip()
+        subject = body.get("subject", "other")
+        message = body.get("message", "").strip()
+        if not email or not message:
+            raise HTTPException(status_code=400, detail="Missing fields")
+        if not RESEND_KEY:
+            raise HTTPException(status_code=503, detail="Email not configured")
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_KEY}", "Content-Type": "application/json"},
+                json={
+                    "from": "Signum Contact <noreply@signumaiapp.com>",
+                    "to": ["hello@signumaiapp.com"],
+                    "reply_to": email,
+                    "subject": f"[Signum Contact] {subject} — {email}",
+                    "text": f"From: {email}\nTopic: {subject}\n\n{message}"
+                },
+                timeout=10,
+            )
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"contact_form error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send")
 
 
 @app.get("/recent-activity")
@@ -4540,22 +4571,13 @@ class EmailHeaderRequest(BaseModel):
     raw_header: str
 
 @app.post("/analyze-email-header")
-async def analyze_email_header(req: EmailHeaderRequest, request: Request):
-    client_ip = request.client.host
-    if is_rate_limited(client_ip, max_calls=10, window=60):
-        raise HTTPException(status_code=429, detail="Too many requests.")
+async def analyze_email_header(req: EmailHeaderRequest):
     """Parse and analyze email headers for phishing/spoofing signals."""
     import re as _re
 
     raw = req.raw_header.strip()
     if not raw or len(raw) < 20:
         raise HTTPException(status_code=400, detail="No header provided")
-    # Strip email body — headers end at first blank line
-    _sep = raw.find("\r\n\r\n")
-    if _sep == -1:
-        _sep = raw.find("\n\n")
-    if _sep != -1:
-        raw = raw[:_sep]
     if len(raw) > 50000:
         raise HTTPException(status_code=400, detail="Header too long")
 
@@ -4575,10 +4597,8 @@ async def analyze_email_header(req: EmailHeaderRequest, request: Request):
     msg_id       = extract(r"^Message-ID:\s*(.+)$", raw)
     date_str     = extract(r"^Date:\s*(.+)$", raw)
 
-    # SPF — try Authentication-Results first, then Received-SPF header
-    spf_result = extract(r"spf=(\w+)", raw)
-    if not spf_result:
-        spf_result = extract(r"^received-spf:\s*(\w+)", raw)
+    # SPF
+    spf_result   = extract(r"spf=(\w+)", raw)
     # DKIM
     dkim_result  = extract(r"dkim=(\w+)", raw)
     # DMARC
@@ -4857,11 +4877,8 @@ class NewsletterSubscribeRequest(BaseModel):
     email: str
 
 @app.post("/newsletter-subscribe")
-async def newsletter_subscribe(req: NewsletterSubscribeRequest, request: Request):
+async def newsletter_subscribe(req: NewsletterSubscribeRequest):
     """Subscribe an email to the Signum weekly scam alerts newsletter."""
-    client_ip = request.client.host
-    if is_rate_limited(client_ip, max_calls=5, window=300):
-        raise HTTPException(status_code=429, detail="Too many requests.")
     import re
     email = req.email.strip().lower()
     if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
