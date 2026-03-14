@@ -4517,6 +4517,31 @@ async def scam_alert_scanner():
                     continue
         except Exception as e:
             logger.error(f"Scam alert scanner error: {e}")
+        # Cleanup: delete alerts older than 14 days, keep max 50
+        try:
+            from datetime import timezone, timedelta
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+            async with httpx.AsyncClient(timeout=10) as client:
+                # Delete older than 14 days
+                await client.delete(
+                    f"{SUPABASE_URL}/rest/v1/scam_alerts?created_at=lt.{cutoff}",
+                    headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+                )
+                # Keep only top 50 by risk_score — get IDs beyond 50
+                r = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/scam_alerts?select=id&order=risk_score.desc&limit=1000",
+                    headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+                )
+                rows = r.json() if r.status_code == 200 else []
+                if len(rows) > 50:
+                    ids_to_delete = [str(row["id"]) for row in rows[50:]]
+                    await client.delete(
+                        f"{SUPABASE_URL}/rest/v1/scam_alerts?id=in.({','.join(ids_to_delete)})",
+                        headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+                    )
+                    logger.info(f"Scam alerts cleanup: removed {len(ids_to_delete)} old entries")
+        except Exception as ce:
+            logger.error(f"Scam alerts cleanup error: {ce}")
         await asyncio.sleep(6 * 3600)
 
 
