@@ -2653,7 +2653,7 @@ def build_seo_page(domain: str, result: dict) -> str:
   <meta property="og:description" content="{description}"/>
   <meta property="og:url" content="https://signumaiapp.com/is-{domain}-safe"/>
   <meta name="twitter:card" content="summary"/>
-  <link rel="canonical" href="https://signumaiapp.com/?domain={domain}"/>
+  <link rel="canonical" href="https://signumaiapp.com/is-{domain}-safe"/>
   <style>
     *{{box-sizing:border-box;margin:0;padding:0}}
     body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0a0f1e;color:#e2e8f0;min-height:100vh}}
