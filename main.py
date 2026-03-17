@@ -2753,21 +2753,49 @@ async def seo_domain_page(domain: str, request: Request):
 
 @app.get("/sitemap-domains.xml", response_class=HTMLResponse)
 async def sitemap_domains():
-    """Sitemap for SEO domain landing pages."""
-    domains = [
+    """Sitemap for SEO domain landing pages — static + scam alerts + recently scanned."""
+    # Static well-known domains
+    static_domains = [
         "amazon.com","ebay.com","temu.com","shein.com","aliexpress.com",
         "binance.com","coinbase.com","kraken.com","bybit.com","kucoin.com",
         "paypal.com","wise.com","revolut.com","stripe.com","cashapp.com",
         "fiverr.com","upwork.com","freelancer.com","toptal.com","guru.com",
         "airbnb.com","booking.com","expedia.com","tripadvisor.com","vrbo.com",
-        "etsy.com","wish.com","banggood.com","dhgate.com","aliexpress.com",
-        "robinhood.com","webull.com","tradingview.com","plus500.com","ig.com",
+        "etsy.com","wish.com","banggood.com","dhgate.com","robinhood.com",
+        "webull.com","tradingview.com","plus500.com","ig.com",
         "instagram.com","facebook.com","twitter.com","tiktok.com","youtube.com",
     ]
+
+    dynamic_domains = []
+    if SUPABASE_URL:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                # Scam alerts domains
+                r1 = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/scam_alerts?select=domain&order=created_at.desc&limit=50",
+                    headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+                )
+                if r1.status_code == 200:
+                    dynamic_domains += [row["domain"] for row in r1.json() if row.get("domain")]
+
+                # Recently scanned domains from scan_results
+                r2 = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/scan_results?select=domain&order=created_at.desc&limit=200",
+                    headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"}
+                )
+                if r2.status_code == 200:
+                    dynamic_domains += [row["domain"] for row in r2.json() if row.get("domain")]
+        except Exception as e:
+            logger.error(f"sitemap_domains fetch error: {e}")
+
+    # Deduplicate, clean, filter out bare TLDs and very short domains
+    all_domains = list(dict.fromkeys(static_domains + dynamic_domains))
+    all_domains = [d for d in all_domains if d and "." in d and len(d) > 4]
+
     base = "https://signumaiapp.com"
     urls = "\n".join([
         f"  <url><loc>{base}/is-{d}-safe</loc><changefreq>weekly</changefreq><priority>0.7</priority></url>"
-        for d in domains
+        for d in all_domains
     ])
     xml = f'''<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
