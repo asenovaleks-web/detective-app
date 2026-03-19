@@ -5222,6 +5222,93 @@ async def newsletter_digest_scheduler():
         await send_newsletter_digest()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# BULK SCAN — Team / API plan only, max 100 domains, returns CSV
+# ══════════════════════════════════════════════════════════════════════════════
+
+from fastapi import UploadFile, File, Form
+from fastapi.responses import StreamingResponse
+import csv, io
+
+@app.post("/bulk-scan")
+async def bulk_scan(
+    file: UploadFile = File(...),
+    user_token: str = Form(...),
+):
+    """Accept a CSV of domains, scan each one, return results as CSV. Team/API only."""
+
+    # Auth
+    user = await get_user_from_token(user_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    user_id = user.get("id")
+    plan = await get_user_plan(user_id)
+    if plan not in ("team", "api"):
+        raise HTTPException(status_code=403, detail="Bulk scan requires Team or API plan")
+
+    # Parse CSV
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="File must be a .csv")
+    content = await file.read()
+    try:
+        text = content.decode("utf-8-sig").strip()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not decode file — use UTF-8 CSV")
+
+    reader = csv.reader(io.StringIO(text))
+    domains = []
+    for row in reader:
+        if not row:
+            continue
+        raw = row[0].strip().lower()
+        # Skip header rows
+        if raw in ("domain", "url", "website", "site"):
+            continue
+        # Strip protocol
+        raw = _re.sub(r"^https?://", "", raw).split("/")[0].strip()
+        if raw and "." in raw and len(raw) <= 253:
+            domains.append(raw)
+        if len(domains) >= 100:
+            break
+
+    if not domains:
+        raise HTTPException(status_code=400, detail="No valid domains found in CSV")
+
+    # Scan each domain sequentially
+    results = []
+    for domain in domains:
+        try:
+            result = await perform_full_scan(domain)
+            score = result.get("score", 0)
+            verdict = result.get("verdict", "UNKNOWN")
+            summary = result.get("verdict_summary", "")
+            results.append({
+                "domain": domain,
+                "score": score,
+                "verdict": verdict,
+                "summary": summary,
+            })
+            await upsert_domain_scan(domain, score, verdict)
+        except Exception as e:
+            logger.warning(f"Bulk scan failed for {domain}: {e}")
+            results.append({"domain": domain, "score": "", "verdict": "ERROR", "summary": str(e)[:120]})
+        await asyncio.sleep(2)
+
+    # Build output CSV
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=["domain", "score", "verdict", "summary"])
+    writer.writeheader()
+    writer.writerows(results)
+    out.seek(0)
+
+    filename = f"signum-bulk-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.csv"
+    return StreamingResponse(
+        io.BytesIO(out.getvalue().encode("utf-8")),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
