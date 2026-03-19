@@ -33,7 +33,7 @@ from datetime import datetime, timezone, timedelta
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -5226,9 +5226,7 @@ async def newsletter_digest_scheduler():
 # BULK SCAN — Team / API plan only, max 100 domains, returns CSV
 # ══════════════════════════════════════════════════════════════════════════════
 
-from fastapi import UploadFile, File, Form
-from fastapi.responses import StreamingResponse
-import csv, io
+import csv
 
 @app.post("/bulk-scan")
 async def bulk_scan(

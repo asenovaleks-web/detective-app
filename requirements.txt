@@ -4,3 +4,4 @@ httpx
 python-dotenv
 pydantic
 reportlab==4.4.1
+python-multipart
