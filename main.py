@@ -3477,13 +3477,23 @@ async def create_checkout_session(req: CheckoutRequest):
 
     user_id = user.get("id")
 
+    # Resolve price ID for the requested plan
+    if req.plan == "team":
+        if not STRIPE_TEAM_PRICE_ID:
+            raise HTTPException(status_code=500, detail="Team plan not configured")
+        price_id = STRIPE_TEAM_PRICE_ID
+    elif req.plan == "api":
+        price_id = STRIPE_API_PRICE_ID or STRIPE_PRICE_ID
+    else:
+        price_id = STRIPE_PRICE_ID
+
     async with httpx.AsyncClient() as client:
         r = await client.post(
             "https://api.stripe.com/v1/checkout/sessions",
             auth=(STRIPE_SECRET, ""),
             data={
                 "mode": "subscription",
-                "line_items[0][price]": STRIPE_TEAM_PRICE_ID if req.plan == "team" and STRIPE_TEAM_PRICE_ID else STRIPE_API_PRICE_ID if req.plan == "api" and STRIPE_API_PRICE_ID else STRIPE_PRICE_ID,
+                "line_items[0][price]": price_id,
                 "line_items[0][quantity]": "1",
                 "customer_email": req.user_email,
                 "success_url": f"{FRONTEND_URL}?upgrade=success",
