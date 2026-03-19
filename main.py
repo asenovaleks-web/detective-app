@@ -5195,7 +5195,7 @@ async def send_newsletter_digest():
                         json={
                             "from": "Signum Alerts <alerts@signumaiapp.com>",
                             "to": email,
-                            "subject": f"🚨 Signum Weekly: {len(alerts)} threats flagged this week",
+                            "subject": f"Signum Weekly Digest — {datetime.now(timezone.utc).strftime('%B %d, %Y')}",
                             "html": html_personal
                         }
                     )
