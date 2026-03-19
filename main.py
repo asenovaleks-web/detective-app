@@ -3425,6 +3425,7 @@ class CheckoutRequest(BaseModel):
     user_token: str
     user_email: str
     plan: str = "pro"
+    referral_code: Optional[str] = None
 
 
 @app.post("/create-scan-checkout")
@@ -3499,7 +3500,11 @@ async def create_checkout_session(req: CheckoutRequest):
                 "success_url": f"{FRONTEND_URL}?upgrade=success",
                 "cancel_url": f"{FRONTEND_URL}?upgrade=cancelled",
                 "metadata[user_id]": user_id,
+                "metadata[plan]": req.plan,
+                **({"metadata[referral_code]": req.referral_code.upper()} if req.referral_code else {}),
                 "subscription_data[metadata][user_id]": user_id,
+                "subscription_data[metadata][plan]": req.plan,
+                **({"subscription_data[metadata][referral_code]": req.referral_code.upper()} if req.referral_code else {}),
             },
             timeout=15,
         )
@@ -3537,12 +3542,20 @@ async def stripe_webhook(request: Request):
 
         if event_type in ("checkout.session.completed", "invoice.payment_succeeded"):
             obj = event.get("data", {}).get("object", {})
-            user_id = obj.get("metadata", {}).get("user_id") or \
-                      obj.get("subscription_details", {}).get("metadata", {}).get("user_id")
+            meta = obj.get("metadata", {}) or obj.get("subscription_details", {}).get("metadata", {}) or {}
+            user_id = meta.get("user_id")
 
             if user_id:
-                await upgrade_user_to_pro(user_id)
-                logger.info(f"Upgraded user {user_id} to Pro")
+                plan = meta.get("plan", "pro")
+                await upgrade_user_to_pro(user_id, plan=plan)
+                logger.info(f"Upgraded user {user_id} to {plan}")
+
+                # Affiliate conversion tracking
+                ref_code = meta.get("referral_code", "")
+                if ref_code and event_type == "checkout.session.completed":
+                    amount_cents = obj.get("amount_total", 0) or 0
+                    session_id = obj.get("id", "")
+                    asyncio.create_task(record_affiliate_conversion(ref_code, user_id, plan, session_id, amount_cents))
 
         elif event_type == "checkout.session.completed":
             obj = event.get("data", {}).get("object", {})
@@ -3567,8 +3580,41 @@ async def stripe_webhook(request: Request):
     return {"status": "ok"}
 
 
-async def upgrade_user_to_pro(user_id: str):
-    """Set user plan to pro in Supabase."""
+async def record_affiliate_conversion(affiliate_code: str, user_id: str, plan: str, stripe_session_id: str, amount_cents: int):
+    """Record a paid conversion for an affiliate and credit their commission."""
+    if not SUPABASE_URL or not affiliate_code:
+        return
+    commission_rate = 0.30
+    amount_eur = amount_cents / 100
+    commission_eur = round(amount_eur * commission_rate, 2)
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/affiliate_conversions",
+                headers={
+                    "apikey": SUPABASE_SERVICE,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "affiliate_code": affiliate_code,
+                    "user_id": user_id,
+                    "stripe_session_id": stripe_session_id,
+                    "plan": plan,
+                    "amount_eur": amount_eur,
+                    "commission_eur": commission_eur,
+                    "paid_out": False,
+                },
+                timeout=5,
+            )
+        logger.info(f"Affiliate conversion recorded: {affiliate_code} → {plan} €{amount_eur} (commission €{commission_eur})")
+    except Exception as e:
+        logger.error(f"record_affiliate_conversion error: {e}")
+
+
+async def upgrade_user_to_pro(user_id: str, plan: str = "pro"):
+    """Set user plan in Supabase. plan can be pro, team, or api."""
+    resolved_plan = plan if plan in ("pro", "team", "api") else "pro"
     async with httpx.AsyncClient() as client:
         await client.patch(
             f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}",
@@ -3578,7 +3624,7 @@ async def upgrade_user_to_pro(user_id: str):
                 "Content-Type": "application/json",
                 "Prefer": "return=minimal",
             },
-            json={"plan": "pro", "subscription_status": "active"},
+            json={"plan": resolved_plan, "subscription_status": "active"},
             timeout=10,
         )
 
@@ -3597,6 +3643,37 @@ async def downgrade_user_to_free(user_id: str):
             json={"plan": "free", "subscription_status": "inactive"},
             timeout=10,
         )
+
+
+@app.get("/affiliate-stats")
+async def affiliate_stats(code: str):
+    """Return conversion stats for an affiliate code."""
+    if not code or len(code) > 32:
+        raise HTTPException(status_code=400, detail="Invalid code")
+    code = code.upper().strip()
+    if not SUPABASE_URL:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/affiliate_conversions?affiliate_code=eq.{code}&select=plan,amount_eur,commission_eur,paid_out,created_at&order=created_at.desc",
+                headers={"apikey": SUPABASE_SERVICE, "Authorization": f"Bearer {SUPABASE_SERVICE}"},
+                timeout=10,
+            )
+        rows = r.json() if r.status_code == 200 else []
+        total_conversions = len(rows)
+        total_commission = sum(row.get("commission_eur", 0) for row in rows)
+        unpaid_commission = sum(row.get("commission_eur", 0) for row in rows if not row.get("paid_out"))
+        return {
+            "code": code,
+            "conversions": total_conversions,
+            "total_commission_eur": round(total_commission, 2),
+            "unpaid_commission_eur": round(unpaid_commission, 2),
+            "recent": rows[:10],
+        }
+    except Exception as e:
+        logger.error(f"affiliate_stats error: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch stats")
 
 
 async def deliver_paid_scan(domain: str, email: str):
